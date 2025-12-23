@@ -6,10 +6,12 @@ import time
 import urllib.parse
 import urllib.request
 from collections import deque
+import asyncio
 
 import requests
-from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import JSONResponse, Response
+import websockets
+from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google import genai
 
 logging.basicConfig(level=logging.INFO)
@@ -17,11 +19,13 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-COMMENTARY_QUEUE: deque[tuple[str, str]] = deque()
+COMMENTARY_QUEUE: deque[tuple[str, str, str]] = deque()
 COMMENTARY_LOCK = threading.Lock()
 COMMENTARY_WORKER_ACTIVE = False
 LAST_LLM_CALL_AT: float | None = None
 LAST_PROCESSED_MOVE_COUNT = 0
+COMMENTARY_SUBSCRIBERS: dict[str, dict] = {}
+COMMENTARY_SUBSCRIBERS_LOCK = threading.Lock()
 CURRENT_TURN = {
     "player_move": None,
     "ai_move": None,
@@ -174,10 +178,10 @@ def stream_game_state(game_id: str) -> None:
                         mover_color = "white" if index % 2 == 0 else "black"
                         if mover_color == human_color:
                             logger.info("PLAYER_MOVE move=%s", move)
-                            enqueue_commentary(move, "PLAYER_MOVE")
+                            enqueue_commentary(game_id, move, "PLAYER_MOVE")
                         else:
                             logger.info("AI_MOVE move=%s", move)
-                            enqueue_commentary(move, "AI_MOVE")
+                            enqueue_commentary(game_id, move, "AI_MOVE")
                     LAST_PROCESSED_MOVE_COUNT = len(moves)
     except requests.RequestException as exc:
         logger.warning("Lichess stream request failed: %s", exc)
@@ -280,7 +284,7 @@ def debug_gradium_test():
     return Response(content=response.content, media_type="audio/wav")
 
 
-def enqueue_commentary(move_uci: str, role: str) -> None:
+def enqueue_commentary(game_id: str, move_uci: str, role: str) -> None:
     if role not in {"PLAYER_MOVE", "AI_MOVE"}:
         raise ValueError(f"Invalid role: {role}")
 
@@ -292,9 +296,9 @@ def enqueue_commentary(move_uci: str, role: str) -> None:
                 _reset_current_turn()
             CURRENT_TURN["player_move"] = move_uci
             CURRENT_TURN["player_commented"] = True
-            COMMENTARY_QUEUE.append((move_uci, role))
+            COMMENTARY_QUEUE.append((game_id, move_uci, role))
             if CURRENT_TURN["ai_move"]:
-                COMMENTARY_QUEUE.append((CURRENT_TURN["ai_move"], "AI_MOVE"))
+                COMMENTARY_QUEUE.append((game_id, CURRENT_TURN["ai_move"], "AI_MOVE"))
                 CURRENT_TURN["ai_commented"] = True
                 _reset_current_turn()
         else:
@@ -302,7 +306,7 @@ def enqueue_commentary(move_uci: str, role: str) -> None:
                 _reset_current_turn()
             CURRENT_TURN["ai_move"] = move_uci
             if CURRENT_TURN["player_commented"]:
-                COMMENTARY_QUEUE.append((move_uci, role))
+                COMMENTARY_QUEUE.append((game_id, move_uci, role))
                 CURRENT_TURN["ai_commented"] = True
                 _reset_current_turn()
 
@@ -329,7 +333,7 @@ def process_commentary_queue() -> None:
             if not COMMENTARY_QUEUE:
                 COMMENTARY_WORKER_ACTIVE = False
                 return
-            move_uci, role = COMMENTARY_QUEUE.popleft()
+            game_id, move_uci, role = COMMENTARY_QUEUE.popleft()
 
         commentary = generate_commentary_mistral(move_uci, role)
         if commentary:
@@ -338,6 +342,7 @@ def process_commentary_queue() -> None:
                 role,
                 commentary.replace('"', "'"),
             )
+            publish_commentary_event(game_id, role, commentary, move_uci)
 
 
 def generate_commentary_mistral(move_uci: str, role: str) -> str | None:
@@ -409,3 +414,124 @@ def throttle_mistral_calls() -> None:
         LAST_LLM_CALL_AT = now + sleep_for
 
     time.sleep(sleep_for)
+
+
+def get_commentary_queue(game_id: str) -> asyncio.Queue:
+    loop = asyncio.get_running_loop()
+    with COMMENTARY_SUBSCRIBERS_LOCK:
+        entry = COMMENTARY_SUBSCRIBERS.get(game_id)
+        if entry and entry["loop"] is loop:
+            entry["subscribers"] += 1
+            return entry["queue"]
+        queue: asyncio.Queue = asyncio.Queue()
+        COMMENTARY_SUBSCRIBERS[game_id] = {
+            "queue": queue,
+            "loop": loop,
+            "subscribers": 1,
+        }
+        return queue
+
+
+def release_commentary_queue(game_id: str) -> None:
+    with COMMENTARY_SUBSCRIBERS_LOCK:
+        entry = COMMENTARY_SUBSCRIBERS.get(game_id)
+        if not entry:
+            return
+        entry["subscribers"] -= 1
+        if entry["subscribers"] <= 0:
+            COMMENTARY_SUBSCRIBERS.pop(game_id, None)
+
+
+def publish_commentary_event(game_id: str, role: str, text: str, move: str) -> None:
+    with COMMENTARY_SUBSCRIBERS_LOCK:
+        entry = COMMENTARY_SUBSCRIBERS.get(game_id)
+        if not entry:
+            return
+        queue = entry["queue"]
+        loop = entry["loop"]
+
+    payload = {"role": role, "text": text, "move": move}
+    try:
+        asyncio.run_coroutine_threadsafe(queue.put(payload), loop)
+    except RuntimeError as exc:
+        logger.warning("Failed to publish commentary event: %s", exc)
+
+
+@app.get("/events/{game_id}")
+async def events(game_id: str):
+    queue = get_commentary_queue(game_id)
+
+    async def event_stream():
+        try:
+            while True:
+                payload = await queue.get()
+                data = json.dumps(payload, ensure_ascii=False)
+                yield f"event: commentary\ndata: {data}\n\n"
+        except asyncio.CancelledError:
+            raise
+        finally:
+            release_commentary_queue(game_id)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.websocket("/ws/tts")
+async def websocket_tts_proxy(websocket: WebSocket):
+    await websocket.accept()
+
+    gradium_key = os.getenv("GRADIUM_API_KEY")
+    if not gradium_key:
+        await websocket.close(code=1011)
+        return
+
+    setup_payload = {
+        "type": "setup",
+        "model_name": "default",
+        "voice_id": "YTpq7expH9539ERJ",
+        "output_format": "pcm",
+    }
+
+    try:
+        async with websockets.connect(
+            "wss://eu.api.gradium.ai/api/speech/tts",
+            extra_headers={"x-api-key": gradium_key},
+        ) as gradium_ws:
+            await gradium_ws.send(json.dumps(setup_payload))
+            while True:
+                raw_message = await gradium_ws.recv()
+                await websocket.send_text(raw_message)
+                try:
+                    message = json.loads(raw_message)
+                except json.JSONDecodeError:
+                    continue
+                if message.get("type") == "ready":
+                    break
+
+            async def forward_client_to_gradium():
+                try:
+                    while True:
+                        client_message = await websocket.receive_text()
+                        await gradium_ws.send(client_message)
+                except WebSocketDisconnect:
+                    await gradium_ws.close()
+
+            async def forward_gradium_to_client():
+                try:
+                    while True:
+                        gradium_message = await gradium_ws.recv()
+                        if isinstance(gradium_message, bytes):
+                            await websocket.send_bytes(gradium_message)
+                        else:
+                            await websocket.send_text(gradium_message)
+                except websockets.exceptions.ConnectionClosed:
+                    await websocket.close()
+
+            await asyncio.wait(
+                [
+                    asyncio.create_task(forward_client_to_gradium()),
+                    asyncio.create_task(forward_gradium_to_client()),
+                ],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+    except websockets.exceptions.ConnectionClosed:
+        await websocket.close()
