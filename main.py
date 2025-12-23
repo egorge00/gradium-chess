@@ -176,7 +176,9 @@ def demo_root():
         });
       }
 
-      button.addEventListener("click", () => {
+      button.addEventListener("click", async () => {
+        ensureAudioContext();
+        await audioContext.resume();
         startDemo();
       });
     </script>
