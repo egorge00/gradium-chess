@@ -2,4 +2,3 @@ fastapi
 google-genai
 requests
 uvicorn
-websockets
