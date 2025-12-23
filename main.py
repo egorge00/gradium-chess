@@ -268,6 +268,8 @@ def debug_gradium_test():
                 "Content-Type": "application/json",
             },
             json=payload,
+            # TODO: Temporary PoC workaround for Gradium's self-signed SSL cert.
+            verify=False,
             timeout=30,
         )
         response.raise_for_status()
