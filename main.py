@@ -138,8 +138,20 @@ def stream_game_state(game_id: str) -> None:
                     mover_color = "white" if index % 2 == 0 else "black"
                     if mover_color == human_color:
                         logger.info("PLAYER_MOVE move=%s", move)
+                        commentary = generate_commentary(move, "PLAYER_MOVE")
+                        if commentary:
+                            logger.info(
+                                'COMMENTARY role=PLAYER_MOVE text="%s"',
+                                commentary.replace('"', "'"),
+                            )
                     else:
                         logger.info("AI_MOVE move=%s", move)
+                        commentary = generate_commentary(move, "AI_MOVE")
+                        if commentary:
+                            logger.info(
+                                'COMMENTARY role=AI_MOVE text="%s"',
+                                commentary.replace('"', "'"),
+                            )
                 last_moves = moves
 
 
@@ -147,3 +159,56 @@ def stream_game_state(game_id: str) -> None:
 def debug_stream(game_id: str, background_tasks: BackgroundTasks):
     background_tasks.add_task(stream_game_state, game_id)
     return {"status": "streaming", "game_id": game_id}
+
+
+def generate_commentary(move_uci: str, role: str) -> str | None:
+    if role not in {"PLAYER_MOVE", "AI_MOVE"}:
+        raise ValueError(f"Invalid role: {role}")
+
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if not openai_key:
+        logger.warning("OPENAI_API_KEY not set; skipping commentary")
+        return None
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "temperature": 0.6,
+        "max_tokens": 120,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Tu es un coach d’échecs calme et pédagogique. "
+                    "Commente le coup donné. 1 phrase (2 max)."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Rôle: {role}. Coup joué (UCI): {move_uci}. "
+                    "Commente ce coup."
+                ),
+            },
+        ],
+    }
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {openai_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("OpenAI commentary request failed: %s", exc)
+        return None
+
+    data = response.json()
+    content = (
+        data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    )
+    return content or None
