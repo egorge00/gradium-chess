@@ -6,7 +6,7 @@ import urllib.request
 
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-import google.generativeai as genai
+from google import genai
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -186,10 +186,10 @@ def debug_gemini_test():
         return {"error": "GEMINI_API_KEY not set"}
 
     try:
-        genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel("gemini-1.0-pro")
-        response = model.generate_content(
-            "Dis bonjour en français en une seule phrase."
+        client = genai.Client(api_key=gemini_key)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents="Dis bonjour en français en une seule phrase.",
         )
         text = (response.text or "").strip()
         if not text:
