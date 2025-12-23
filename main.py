@@ -74,7 +74,9 @@ def demo_root():
 
       function ensureAudioContext() {
         if (!audioContext) {
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: 48000,
+          });
         }
       }
 
@@ -820,7 +822,9 @@ def demo():
 
       function ensureAudioContext() {
         if (!audioContext) {
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: 48000,
+          });
         }
       }
 
