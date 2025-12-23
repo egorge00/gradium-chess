@@ -68,11 +68,10 @@ def start_game():
         or data.get("game", {}).get("id")
         or data.get("challenge", {}).get("id")
     )
-    game_url = (
-        data.get("url")
-        or data.get("game", {}).get("url")
-        or data.get("challenge", {}).get("url")
-    )
+    if not game_id:
+        raise HTTPException(status_code=502, detail="Lichess response missing game id")
+
+    game_url = f"https://lichess.org/{game_id}"
 
     return {"game_id": game_id, "game_url": game_url}
 
