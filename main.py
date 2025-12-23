@@ -34,7 +34,7 @@ def env_check():
 
 
 @app.post("/start-game")
-def start_game():
+def start_game(background_tasks: BackgroundTasks):
     lichess_token = os.getenv("LICHESS_TOKEN")
     if not lichess_token:
         raise HTTPException(status_code=500, detail="LICHESS_TOKEN not set")
@@ -78,18 +78,21 @@ def start_game():
 
     game_url = f"https://lichess.org/{game_id}"
 
+    background_tasks.add_task(stream_game_state, game_id)
+
     return {"game_id": game_id, "game_url": game_url}
 
 
 @app.get("/start-game-test")
-def start_game_test():
-    return start_game()
+def start_game_test(background_tasks: BackgroundTasks):
+    return start_game(background_tasks)
 
 
 def stream_game_state(game_id: str) -> None:
     lichess_token = os.getenv("LICHESS_TOKEN")
     if not lichess_token:
-        raise HTTPException(status_code=500, detail="LICHESS_TOKEN not set")
+        logger.error("LICHESS_TOKEN not set; cannot stream game")
+        return
 
     stream_url = f"https://lichess.org/api/board/game/stream/{game_id}"
     headers = {
@@ -100,59 +103,64 @@ def stream_game_state(game_id: str) -> None:
     human_color = None
     last_moves: list[str] = []
 
-    with requests.get(stream_url, headers=headers, stream=True, timeout=60) as response:
-        response.raise_for_status()
-        for line in response.iter_lines():
-            if not line:
-                continue
-            try:
-                event = json.loads(line.decode("utf-8"))
-            except json.JSONDecodeError:
-                logger.warning("Failed to decode stream line: %s", line)
-                continue
-            event_type = event.get("type")
-            if event_type == "gameFull":
-                white_player = event.get("white", {})
-                black_player = event.get("black", {})
-                if "aiLevel" in white_player:
-                    human_color = "black"
-                elif "aiLevel" in black_player:
-                    human_color = "white"
-                else:
-                    human_color = None
-                logger.info("gameFull human_color=%s", human_color)
-
-                initial_moves = event.get("state", {}).get("moves", "")
-                last_moves = initial_moves.split() if initial_moves else []
-                continue
-
-            if event_type == "gameState":
-                moves_text = event.get("moves", "")
-                moves = moves_text.split() if moves_text else []
-
-                if moves[: len(last_moves)] != last_moves:
-                    last_moves = []
-
-                new_moves = moves[len(last_moves) :]
-                for index, move in enumerate(new_moves, start=len(last_moves)):
-                    mover_color = "white" if index % 2 == 0 else "black"
-                    if mover_color == human_color:
-                        logger.info("PLAYER_MOVE move=%s", move)
-                        commentary = generate_commentary(move, "PLAYER_MOVE")
-                        if commentary:
-                            logger.info(
-                                'COMMENTARY role=PLAYER_MOVE text="%s"',
-                                commentary.replace('"', "'"),
-                            )
+    try:
+        with requests.get(
+            stream_url, headers=headers, stream=True, timeout=60
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line.decode("utf-8"))
+                except json.JSONDecodeError:
+                    logger.warning("Failed to decode stream line: %s", line)
+                    continue
+                event_type = event.get("type")
+                if event_type == "gameFull":
+                    white_player = event.get("white", {})
+                    black_player = event.get("black", {})
+                    if "aiLevel" in white_player:
+                        human_color = "black"
+                    elif "aiLevel" in black_player:
+                        human_color = "white"
                     else:
-                        logger.info("AI_MOVE move=%s", move)
-                        commentary = generate_commentary(move, "AI_MOVE")
-                        if commentary:
-                            logger.info(
-                                'COMMENTARY role=AI_MOVE text="%s"',
-                                commentary.replace('"', "'"),
-                            )
-                last_moves = moves
+                        human_color = None
+                    logger.info("gameFull human_color=%s", human_color)
+
+                    initial_moves = event.get("state", {}).get("moves", "")
+                    last_moves = initial_moves.split() if initial_moves else []
+                    continue
+
+                if event_type == "gameState":
+                    moves_text = event.get("moves", "")
+                    moves = moves_text.split() if moves_text else []
+
+                    if moves[: len(last_moves)] != last_moves:
+                        last_moves = []
+
+                    new_moves = moves[len(last_moves) :]
+                    for index, move in enumerate(new_moves, start=len(last_moves)):
+                        mover_color = "white" if index % 2 == 0 else "black"
+                        if mover_color == human_color:
+                            logger.info("PLAYER_MOVE move=%s", move)
+                            commentary = generate_commentary(move, "PLAYER_MOVE")
+                            if commentary:
+                                logger.info(
+                                    'COMMENTARY role=PLAYER_MOVE text="%s"',
+                                    commentary.replace('"', "'"),
+                                )
+                        else:
+                            logger.info("AI_MOVE move=%s", move)
+                            commentary = generate_commentary(move, "AI_MOVE")
+                            if commentary:
+                                logger.info(
+                                    'COMMENTARY role=AI_MOVE text="%s"',
+                                    commentary.replace('"', "'"),
+                                )
+                    last_moves = moves
+    except requests.RequestException as exc:
+        logger.warning("Lichess stream request failed: %s", exc)
 
 
 @app.get("/debug/stream/{game_id}")
