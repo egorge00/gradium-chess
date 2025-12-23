@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -6,18 +7,20 @@ import time
 import urllib.parse
 import urllib.request
 from collections import deque
-import asyncio
+from pathlib import Path
+from uuid import uuid4
 
 import requests
-import websockets
-from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel
 from google import genai
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+TTS_TMP_DIR = Path("/tmp")
 
 COMMENTARY_QUEUE: deque[tuple[str, str, str]] = deque()
 COMMENTARY_LOCK = threading.Lock()
@@ -32,6 +35,10 @@ CURRENT_TURN = {
     "player_commented": False,
     "ai_commented": False,
 }
+
+
+class TtsRequest(BaseModel):
+    text: str
 
 @app.get("/health")
 def health():
@@ -60,109 +67,22 @@ def demo_root():
     <button id="start-demo">Démarrer la démo</button>
     <script>
       const button = document.getElementById("start-demo");
-      let socket;
-      let audioContext;
-      const pendingTexts = [];
-      const audioChunks = [];
-
-      function getSocketUrl() {
-        const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-        return `${scheme}://${window.location.host}/ws/tts`;
-      }
-
-      function decodeBase64(base64Audio) {
-        const binary = atob(base64Audio);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i += 1) {
-          bytes[i] = binary.charCodeAt(i);
-        }
-        return bytes;
-      }
-
-      function playPcmBytes(bytes) {
-        const alignedBuffer = bytes.buffer.slice(
-          bytes.byteOffset,
-          bytes.byteOffset + bytes.byteLength,
-        );
-        const pcm = new Int16Array(alignedBuffer);
-        const samples = new Float32Array(pcm.length);
-        for (let i = 0; i < pcm.length; i += 1) {
-          samples[i] = pcm[i] / 32768;
-        }
-        if (!audioContext) {
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        }
-        const buffer = audioContext.createBuffer(1, samples.length, 24000);
-        buffer.getChannelData(0).set(samples);
-        const source = audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioContext.destination);
-        source.start();
-      }
-
-      function bufferAudio(base64Audio) {
-        audioChunks.push(decodeBase64(base64Audio));
-      }
-
-      function playBufferedAudio() {
-        if (audioChunks.length === 0) {
+      async function playCommentary(text) {
+        const response = await fetch("/tts", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        if (!response.ok) {
           return;
         }
-        const totalLength = audioChunks.reduce(
-          (total, chunk) => total + chunk.length,
-          0,
-        );
-        const combined = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const chunk of audioChunks) {
-          combined.set(chunk, offset);
-          offset += chunk.length;
+        const data = await response.json();
+        if (!data.audio_url) {
+          return;
         }
-        audioChunks.length = 0;
-        playPcmBytes(combined);
-      }
-
-      function ensureSocket() {
-        if (socket && socket.readyState === WebSocket.OPEN) {
-          return socket;
-        }
-        if (socket && socket.readyState === WebSocket.CONNECTING) {
-          return socket;
-        }
-        socket = new WebSocket(getSocketUrl());
-        socket.addEventListener("open", () => {
-          while (pendingTexts.length > 0) {
-            const next = pendingTexts.shift();
-            if (next) {
-              socket.send(JSON.stringify(next));
-            }
-          }
-        });
-        socket.addEventListener("message", (event) => {
-          let message;
-          try {
-            message = JSON.parse(event.data);
-          } catch (error) {
-            return;
-          }
-          if (message.type === "audio" && message.audio) {
-            bufferAudio(message.audio);
-          }
-          if (message.type === "end_of_stream") {
-            playBufferedAudio();
-          }
-        });
-        return socket;
-      }
-
-      function sendCommentary(text) {
-        const payload = { type: "text", text };
-        const ws = ensureSocket();
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify(payload));
-        } else {
-          pendingTexts.push(payload);
-        }
+        const audio = new Audio(data.audio_url);
+        audio.autoplay = true;
+        audio.play();
       }
 
       async function startDemo() {
@@ -179,7 +99,7 @@ def demo_root():
           try {
             const payload = JSON.parse(event.data);
             if (payload && payload.text) {
-              sendCommentary(payload.text);
+              playCommentary(payload.text);
             }
           } catch (error) {
             return;
@@ -443,6 +363,58 @@ def debug_gradium_test():
     return Response(content=response.content, media_type="audio/wav")
 
 
+@app.post("/tts")
+def tts(request: TtsRequest):
+    gradium_key = os.getenv("GRADIUM_API_KEY")
+    if not gradium_key:
+        return JSONResponse(
+            status_code=500, content={"error": "GRADIUM_API_KEY not set"}
+        )
+
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    payload = {
+        "text": text,
+        "voice_id": "b35yykvVppLXyw_l",
+        "format": "wav",
+    }
+
+    try:
+        response = requests.post(
+            "https://api.gradium.ai/v1/tts/synthesize",
+            headers={
+                "Authorization": f"Bearer {gradium_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            # TODO: Temporary PoC workaround for Gradium's self-signed SSL cert.
+            verify=False,
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("Gradium TTS request failed: %s", exc)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+    filename = f"tts_{uuid4().hex}.wav"
+    file_path = TTS_TMP_DIR / filename
+    file_path.write_bytes(response.content)
+
+    return {"audio_url": f"/audio/{filename}"}
+
+
+@app.get("/audio/{filename}")
+def get_audio(filename: str):
+    if not filename.startswith("tts_") or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    file_path = TTS_TMP_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Audio not found")
+    return FileResponse(path=file_path, media_type="audio/wav")
+
+
 def enqueue_commentary(game_id: str, move_uci: str, role: str) -> None:
     if role not in {"PLAYER_MOVE", "AI_MOVE"}:
         raise ValueError(f"Invalid role: {role}")
@@ -634,80 +606,6 @@ async def events(game_id: str):
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-@app.get("/ws-test")
-def ws_test():
-    html = """<!doctype html>
-<html lang="fr">
-  <head>
-    <meta charset="utf-8" />
-    <title>Test WS TTS</title>
-  </head>
-  <body>
-    <button id="speak">Parler</button>
-    <script>
-      const button = document.getElementById("speak");
-      let socket;
-      let audioContext;
-
-      function getSocketUrl() {
-        const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-        return `${scheme}://${window.location.host}/ws/tts`;
-      }
-
-      function playPcm(base64Audio) {
-        const binary = atob(base64Audio);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i += 1) {
-          bytes[i] = binary.charCodeAt(i);
-        }
-        const pcm = new Int16Array(bytes.buffer);
-        const samples = new Float32Array(pcm.length);
-        for (let i = 0; i < pcm.length; i += 1) {
-          samples[i] = pcm[i] / 32768;
-        }
-        if (!audioContext) {
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        }
-        const buffer = audioContext.createBuffer(1, samples.length, 24000);
-        buffer.getChannelData(0).set(samples);
-        const source = audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioContext.destination);
-        source.start();
-      }
-
-      function sendTestText() {
-        const payload = {
-          type: "text",
-          text: "Bonjour, ceci est un test de la voix Gradium.",
-        };
-        socket.send(JSON.stringify(payload));
-      }
-
-      button.addEventListener("click", () => {
-        if (socket && socket.readyState === WebSocket.OPEN) {
-          sendTestText();
-          return;
-        }
-        socket = new WebSocket(getSocketUrl());
-        socket.addEventListener("open", sendTestText);
-        socket.addEventListener("message", (event) => {
-          let message;
-          try {
-            message = JSON.parse(event.data);
-          } catch (error) {
-            return;
-          }
-          if (message.type === "audio" && message.audio) {
-            playPcm(message.audio);
-          }
-        });
-      });
-    </script>
-  </body>
-</html>
-"""
-    return Response(content=html, media_type="text/html")
 
 
 @app.get("/demo")
@@ -782,108 +680,15 @@ def demo():
       const sseStatusEl = document.getElementById("sse-status");
       const ttsStatusEl = document.getElementById("tts-status");
 
-      let socket;
-      let ttsReady = false;
-      let speaking = false;
-      let sendLoopActive = false;
-      let lastSentAt = 0;
-
-      let audioContext;
-      let nextAudioTime = 0;
-
       const ttsQueue = [];
       let expectedRole = "PLAYER_MOVE";
       let bufferedPlayer = null;
       let bufferedAi = null;
+      let playing = false;
 
       function log(message) {
         const line = `[${new Date().toLocaleTimeString()}] ${message}\\n`;
         logEl.textContent = line + logEl.textContent;
-      }
-
-      function sleep(ms) {
-        return new Promise((resolve) => setTimeout(resolve, ms));
-      }
-
-      function getSocketUrl() {
-        const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-        return `${scheme}://${window.location.host}/ws/tts`;
-      }
-
-      function ensureAudioContext() {
-        if (!audioContext) {
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        }
-      }
-
-      function schedulePcmPlayback(int16Samples) {
-        ensureAudioContext();
-        const samples = new Float32Array(int16Samples.length);
-        for (let i = 0; i < int16Samples.length; i += 1) {
-          samples[i] = int16Samples[i] / 32768;
-        }
-        const buffer = audioContext.createBuffer(1, samples.length, 24000);
-        buffer.getChannelData(0).set(samples);
-        const source = audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioContext.destination);
-        const startAt = Math.max(audioContext.currentTime, nextAudioTime);
-        source.start(startAt);
-        nextAudioTime = startAt + buffer.duration;
-      }
-
-      function handleSocketMessage(event) {
-        if (typeof event.data === "string") {
-          let message;
-          try {
-            message = JSON.parse(event.data);
-          } catch (error) {
-            return;
-          }
-          if (message.type === "ready") {
-            ttsReady = true;
-            ttsStatusEl.classList.add("connected");
-            ttsStatusEl.textContent = "ready";
-            pumpTtsQueue();
-            return;
-          }
-          if (message.type === "audio" && message.audio) {
-            const binary = atob(message.audio);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i += 1) {
-              bytes[i] = binary.charCodeAt(i);
-            }
-            schedulePcmPlayback(new Int16Array(bytes.buffer));
-            return;
-          }
-          if (message.type === "end_of_stream") {
-            speaking = false;
-            pumpTtsQueue();
-          }
-          return;
-        }
-
-        if (event.data instanceof ArrayBuffer) {
-          schedulePcmPlayback(new Int16Array(event.data));
-        } else if (event.data && event.data.arrayBuffer) {
-          event.data.arrayBuffer().then((buffer) => {
-            schedulePcmPlayback(new Int16Array(buffer));
-          });
-        }
-      }
-
-      function connectSocket() {
-        socket = new WebSocket(getSocketUrl());
-        socket.binaryType = "arraybuffer";
-        socket.addEventListener("open", () => {
-          ttsStatusEl.textContent = "connecting…";
-        });
-        socket.addEventListener("close", () => {
-          ttsReady = false;
-          ttsStatusEl.classList.remove("connected");
-          ttsStatusEl.textContent = "disconnected";
-        });
-        socket.addEventListener("message", handleSocketMessage);
       }
 
       function enqueueTts(text, role) {
@@ -930,34 +735,42 @@ def demo():
       }
 
       async function pumpTtsQueue() {
-        if (sendLoopActive) {
+        if (playing) {
           return;
         }
-        sendLoopActive = true;
         while (ttsQueue.length > 0) {
-          if (!socket || socket.readyState !== WebSocket.OPEN || !ttsReady) {
-            await sleep(200);
-            continue;
-          }
-          if (speaking) {
-            await sleep(100);
-            continue;
-          }
-          const now = Date.now();
-          const elapsed = now - lastSentAt;
-          if (elapsed < 1000) {
-            await sleep(1000 - elapsed);
-          }
           const next = ttsQueue.shift();
           if (!next) {
             continue;
           }
-          const payload = { type: "text", text: next.text };
-          socket.send(JSON.stringify(payload));
-          lastSentAt = Date.now();
-          speaking = true;
+          playing = true;
+          ttsStatusEl.textContent = "playing";
+          ttsStatusEl.classList.add("connected");
+          try {
+            const response = await fetch("/tts", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ text: next.text }),
+            });
+            if (!response.ok) {
+              continue;
+            }
+            const data = await response.json();
+            if (!data.audio_url) {
+              continue;
+            }
+            await new Promise((resolve) => {
+              const audio = new Audio(data.audio_url);
+              audio.addEventListener("ended", resolve, { once: true });
+              audio.addEventListener("error", resolve, { once: true });
+              audio.play();
+            });
+          } finally {
+            playing = false;
+            ttsStatusEl.textContent = "idle";
+            ttsStatusEl.classList.remove("connected");
+          }
         }
-        sendLoopActive = false;
       }
 
       async function startDemo() {
@@ -986,95 +799,10 @@ def demo():
         });
       }
 
-      connectSocket();
+      ttsStatusEl.textContent = "idle";
       startDemo();
     </script>
   </body>
 </html>
 """
     return Response(content=html, media_type="text/html")
-
-
-@app.websocket("/ws/tts")
-async def websocket_tts_proxy(websocket: WebSocket):
-    await websocket.accept()
-
-    gradium_key = os.getenv("GRADIUM_API_KEY")
-    if not gradium_key:
-        await websocket.close(code=1011)
-        return
-
-    setup_payload = {
-        "type": "setup",
-        "model_name": "default",
-        "voice_id": "YTpq7expH9539ERJ",
-        "output_format": "wav",
-    }
-
-    try:
-        async with websockets.connect(
-            "wss://eu.api.gradium.ai/api/speech/tts",
-            additional_headers={"x-api-key": gradium_key},
-        ) as gradium_ws:
-            await gradium_ws.send(json.dumps(setup_payload))
-
-            ready_event = asyncio.Event()
-
-            async def forward_client_to_gradium():
-                try:
-                    while True:
-                        client_message = await websocket.receive_text()
-                        try:
-                            message = json.loads(client_message)
-                        except json.JSONDecodeError:
-                            continue
-
-                        if message.get("type") != "text":
-                            continue
-
-                        await ready_event.wait()
-                        logger.info("FORWARD TEXT")
-                        await gradium_ws.send(client_message)
-                except WebSocketDisconnect:
-                    await gradium_ws.close()
-                except websockets.exceptions.ConnectionClosed:
-                    await websocket.close()
-
-            async def forward_gradium_to_client():
-                try:
-                    while True:
-                        gradium_message = await gradium_ws.recv()
-                        if isinstance(gradium_message, bytes):
-                            logger.info("FORWARD AUDIO")
-                            await websocket.send_bytes(gradium_message)
-                            continue
-
-                        await websocket.send_text(gradium_message)
-                        try:
-                            message = json.loads(gradium_message)
-                        except json.JSONDecodeError:
-                            continue
-
-                        message_type = message.get("type")
-                        if message_type == "ready":
-                            logger.info("GRADIUM READY")
-                            ready_event.set()
-                        elif message_type == "audio":
-                            logger.info("FORWARD AUDIO")
-                        elif message_type == "end_of_stream":
-                            logger.info("END OF STREAM")
-                except websockets.exceptions.ConnectionClosed:
-                    pass
-                except WebSocketDisconnect:
-                    await gradium_ws.close()
-                finally:
-                    await websocket.close()
-
-            tasks = [
-                asyncio.create_task(forward_client_to_gradium()),
-                asyncio.create_task(forward_gradium_to_client()),
-            ]
-
-            await asyncio.gather(*tasks)
-    except websockets.exceptions.ConnectionClosed:
-        await websocket.close()
