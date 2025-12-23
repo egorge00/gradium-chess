@@ -74,7 +74,9 @@ def demo_root():
 
       function ensureAudioContext() {
         if (!audioContext) {
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: ttsSampleRate,
+          });
         }
       }
 
@@ -88,7 +90,6 @@ def demo_root():
         buffer.getChannelData(0).set(samples);
         const source = audioContext.createBufferSource();
         source.buffer = buffer;
-        source.playbackRate.value = 1.5;
         source.connect(audioContext.destination);
         const startAt = Math.max(audioContext.currentTime, nextAudioTime);
         source.start(startAt);
@@ -814,7 +815,9 @@ def demo():
 
       function ensureAudioContext() {
         if (!audioContext) {
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: 48000,
+          });
         }
       }
 
@@ -828,7 +831,6 @@ def demo():
         buffer.getChannelData(0).set(samples);
         const source = audioContext.createBufferSource();
         source.buffer = buffer;
-        source.playbackRate.value = 1.5;
         source.connect(audioContext.destination);
         const startAt = Math.max(audioContext.currentTime, nextAudioTime);
         source.start(startAt);
