@@ -38,6 +38,131 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/")
+def demo_root():
+    html = """<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <title>Gradium Chess Demo</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 32px;
+      }
+      button {
+        font-size: 16px;
+        padding: 12px 18px;
+      }
+    </style>
+  </head>
+  <body>
+    <button id="start-demo">Démarrer la démo</button>
+    <script>
+      const button = document.getElementById("start-demo");
+      let socket;
+      let audioContext;
+      const pendingTexts = [];
+
+      function getSocketUrl() {
+        const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+        return `${scheme}://${window.location.host}/ws/tts`;
+      }
+
+      function playPcm(base64Audio) {
+        const binary = atob(base64Audio);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        const pcm = new Int16Array(bytes.buffer);
+        const samples = new Float32Array(pcm.length);
+        for (let i = 0; i < pcm.length; i += 1) {
+          samples[i] = pcm[i] / 32768;
+        }
+        if (!audioContext) {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        const buffer = audioContext.createBuffer(1, samples.length, 24000);
+        buffer.getChannelData(0).set(samples);
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioContext.destination);
+        source.start();
+      }
+
+      function ensureSocket() {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          return socket;
+        }
+        if (socket && socket.readyState === WebSocket.CONNECTING) {
+          return socket;
+        }
+        socket = new WebSocket(getSocketUrl());
+        socket.addEventListener("open", () => {
+          while (pendingTexts.length > 0) {
+            const next = pendingTexts.shift();
+            if (next) {
+              socket.send(JSON.stringify(next));
+            }
+          }
+        });
+        socket.addEventListener("message", (event) => {
+          let message;
+          try {
+            message = JSON.parse(event.data);
+          } catch (error) {
+            return;
+          }
+          if (message.type === "audio" && message.audio) {
+            playPcm(message.audio);
+          }
+        });
+        return socket;
+      }
+
+      function sendCommentary(text) {
+        const payload = { type: "text", text };
+        const ws = ensureSocket();
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(payload));
+        } else {
+          pendingTexts.push(payload);
+        }
+      }
+
+      async function startDemo() {
+        const response = await fetch("/start-game-demo");
+        const data = await response.json();
+        if (data.game_url) {
+          window.open(data.game_url, "_blank", "noopener,noreferrer");
+        }
+        if (!data.game_id) {
+          return;
+        }
+        const eventSource = new EventSource(`/events/${data.game_id}`);
+        eventSource.addEventListener("commentary", (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload && payload.text) {
+              sendCommentary(payload.text);
+            }
+          } catch (error) {
+            return;
+          }
+        });
+      }
+
+      button.addEventListener("click", () => {
+        startDemo();
+      });
+    </script>
+  </body>
+</html>
+"""
+    return Response(content=html, media_type="text/html")
+
+
 @app.get("/env-check")
 def env_check():
     ai_level_value = os.getenv("AI_LEVEL")
