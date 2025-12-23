@@ -1,9 +1,14 @@
 import json
+import logging
 import os
 import urllib.parse
 import urllib.request
 
-from fastapi import FastAPI, HTTPException
+import requests
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -79,3 +84,37 @@ def start_game():
 @app.get("/start-game-test")
 def start_game_test():
     return start_game()
+
+
+def stream_game_state(game_id: str) -> None:
+    lichess_token = os.getenv("LICHESS_TOKEN")
+    if not lichess_token:
+        raise HTTPException(status_code=500, detail="LICHESS_TOKEN not set")
+
+    stream_url = f"https://lichess.org/api/board/game/stream/{game_id}"
+    headers = {
+        "Authorization": f"Bearer {lichess_token}",
+        "Accept": "application/json",
+    }
+
+    with requests.get(stream_url, headers=headers, stream=True, timeout=60) as response:
+        response.raise_for_status()
+        for line in response.iter_lines():
+            if not line:
+                continue
+            try:
+                event = json.loads(line.decode("utf-8"))
+            except json.JSONDecodeError:
+                logger.warning("Failed to decode stream line: %s", line)
+                continue
+            if event.get("type") == "gameState":
+                moves_text = event.get("moves", "")
+                moves = moves_text.split() if moves_text else []
+                turn = "white" if len(moves) % 2 == 0 else "black"
+                logger.info("gameState moves=%s turn=%s", moves, turn)
+
+
+@app.get("/debug/stream/{game_id}")
+def debug_stream(game_id: str, background_tasks: BackgroundTasks):
+    background_tasks.add_task(stream_game_state, game_id)
+    return {"status": "streaming", "game_id": game_id}
