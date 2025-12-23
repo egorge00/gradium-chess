@@ -66,6 +66,7 @@ def demo_root():
       let audioContext;
       let nextAudioTime = 0;
       const ttsQueue = [];
+      let firstAudioLogged = false;
 
       function getSocketUrl() {
         const scheme = window.location.protocol === "https:" ? "wss" : "ws";
@@ -110,6 +111,10 @@ def demo_root():
             return;
           }
           if (message.type === "audio" && message.audio) {
+            if (!firstAudioLogged) {
+              console.log("First audio message received:", message);
+              firstAudioLogged = true;
+            }
             const binary = atob(message.audio);
             const bytes = new Uint8Array(binary.length);
             for (let i = 0; i < binary.length; i += 1) {
