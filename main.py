@@ -564,8 +564,7 @@ async def websocket_tts_proxy(websocket: WebSocket):
         "type": "setup",
         "model_name": "default",
         "voice_id": "YTpq7expH9539ERJ",
-        "output_format": "pcm_s16le",
-        "sample_rate": 48000,
+        "output_format": "pcm",
     }
 
     try:
