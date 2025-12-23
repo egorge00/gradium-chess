@@ -576,30 +576,33 @@ async def websocket_tts_proxy(websocket: WebSocket):
             await gradium_ws.send(json.dumps(setup_payload))
 
             ready_event = asyncio.Event()
-            end_of_stream_event = asyncio.Event()
-            client_closed_event = asyncio.Event()
-            client_message_queue: asyncio.Queue[str] = asyncio.Queue()
 
             async def forward_client_to_gradium():
                 try:
                     while True:
                         client_message = await websocket.receive_text()
-                        await client_message_queue.put(client_message)
-                except WebSocketDisconnect:
-                    client_closed_event.set()
-                    await gradium_ws.close()
+                        try:
+                            message = json.loads(client_message)
+                        except json.JSONDecodeError:
+                            continue
 
-            async def send_buffered_to_gradium():
-                await ready_event.wait()
-                while True:
-                    client_message = await client_message_queue.get()
-                    await gradium_ws.send(client_message)
+                        if message.get("type") != "text":
+                            continue
+
+                        await ready_event.wait()
+                        logger.info("FORWARD TEXT")
+                        await gradium_ws.send(client_message)
+                except WebSocketDisconnect:
+                    await gradium_ws.close()
+                except websockets.exceptions.ConnectionClosed:
+                    await websocket.close()
 
             async def forward_gradium_to_client():
                 try:
                     while True:
                         gradium_message = await gradium_ws.recv()
                         if isinstance(gradium_message, bytes):
+                            logger.info("FORWARD AUDIO")
                             await websocket.send_bytes(gradium_message)
                             continue
 
@@ -614,38 +617,21 @@ async def websocket_tts_proxy(websocket: WebSocket):
                             logger.info("GRADIUM READY")
                             ready_event.set()
                         elif message_type == "audio":
-                            logger.info("GRADIUM AUDIO chunk")
+                            logger.info("FORWARD AUDIO")
                         elif message_type == "end_of_stream":
-                            logger.info("GRADIUM END_OF_STREAM")
-                            end_of_stream_event.set()
-                            break
+                            logger.info("END OF STREAM")
                 except websockets.exceptions.ConnectionClosed:
                     pass
+                except WebSocketDisconnect:
+                    await gradium_ws.close()
                 finally:
-                    if not client_closed_event.is_set():
-                        await websocket.close()
+                    await websocket.close()
 
             tasks = [
                 asyncio.create_task(forward_client_to_gradium()),
-                asyncio.create_task(send_buffered_to_gradium()),
                 asyncio.create_task(forward_gradium_to_client()),
             ]
 
-            done, pending = await asyncio.wait(
-                [
-                    asyncio.create_task(end_of_stream_event.wait()),
-                    asyncio.create_task(client_closed_event.wait()),
-                ],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            for task in pending:
-                task.cancel()
-            for task in tasks:
-                task.cancel()
-
-            await asyncio.gather(*tasks, return_exceptions=True)
-            for task in done:
-                task.cancel()
+            await asyncio.gather(*tasks)
     except websockets.exceptions.ConnectionClosed:
         await websocket.close()
