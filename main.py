@@ -62,10 +62,8 @@ def demo_root():
       const button = document.getElementById("start-demo");
       let socket;
       let ttsReady = false;
-      let speaking = false;
       let audioContext;
       let nextAudioTime = 0;
-      const ttsQueue = [];
       let firstAudioLogged = false;
 
       function getSocketUrl() {
@@ -107,7 +105,6 @@ def demo_root():
           }
           if (message.type === "ready") {
             ttsReady = true;
-            pumpTtsQueue();
             return;
           }
           if (message.type === "audio" && message.audio) {
@@ -123,10 +120,6 @@ def demo_root():
             schedulePcmPlayback(new Int16Array(bytes.buffer));
             return;
           }
-          if (message.type === "end_of_stream") {
-            speaking = false;
-            pumpTtsQueue();
-          }
           return;
         }
 
@@ -140,6 +133,9 @@ def demo_root():
       }
 
       function connectSocket() {
+        if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+          return;
+        }
         socket = new WebSocket(getSocketUrl());
         socket.binaryType = "arraybuffer";
         socket.addEventListener("close", () => {
@@ -148,25 +144,17 @@ def demo_root():
         socket.addEventListener("message", handleSocketMessage);
       }
 
-      function pumpTtsQueue() {
-        if (!ttsReady || speaking || !socket || socket.readyState !== WebSocket.OPEN) {
+      function sendTts(text) {
+        if (!ttsReady || !socket || socket.readyState !== WebSocket.OPEN) {
           return;
         }
-        const next = ttsQueue.shift();
-        if (!next) {
-          return;
-        }
-        const payload = { type: "text", text: next };
+        console.log("SEND TO TTS", text);
+        const payload = { type: "text", text };
         socket.send(JSON.stringify(payload));
-        speaking = true;
-      }
-
-      function enqueueTts(text) {
-        ttsQueue.push(text);
-        pumpTtsQueue();
       }
 
       async function startDemo() {
+        connectSocket();
         const response = await fetch("/start-game-demo");
         const data = await response.json();
         if (data.game_url) {
@@ -180,7 +168,7 @@ def demo_root():
           try {
             const payload = JSON.parse(event.data);
             if (payload && payload.text) {
-              enqueueTts(payload.text);
+              sendTts(payload.text);
             }
           } catch (error) {
             return;
@@ -189,9 +177,6 @@ def demo_root():
       }
 
       button.addEventListener("click", () => {
-        if (!socket || socket.readyState !== WebSocket.OPEN) {
-          connectSocket();
-        }
         startDemo();
       });
     </script>
