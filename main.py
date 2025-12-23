@@ -20,6 +20,11 @@ COMMENTARY_QUEUE: deque[tuple[str, str]] = deque()
 COMMENTARY_LOCK = threading.Lock()
 COMMENTARY_WORKER_ACTIVE = False
 LAST_LLM_CALL_AT: float | None = None
+CURRENT_TURN = {
+    "player_move": None,
+    "ai_move": None,
+    "player_commented": False,
+}
 
 @app.get("/health")
 def health():
@@ -241,13 +246,33 @@ def enqueue_commentary(move_uci: str, role: str) -> None:
     global COMMENTARY_WORKER_ACTIVE
 
     with COMMENTARY_LOCK:
-        COMMENTARY_QUEUE.append((move_uci, role))
-        if COMMENTARY_WORKER_ACTIVE:
+        if role == "PLAYER_MOVE":
+            CURRENT_TURN["player_move"] = move_uci
+            CURRENT_TURN["player_commented"] = True
+            COMMENTARY_QUEUE.append((move_uci, role))
+
+            if CURRENT_TURN["ai_move"]:
+                COMMENTARY_QUEUE.append((CURRENT_TURN["ai_move"], "AI_MOVE"))
+                _reset_current_turn()
+        else:
+            if not CURRENT_TURN["player_commented"]:
+                CURRENT_TURN["ai_move"] = move_uci
+            else:
+                COMMENTARY_QUEUE.append((move_uci, role))
+                _reset_current_turn()
+
+        if COMMENTARY_WORKER_ACTIVE or not COMMENTARY_QUEUE:
             return
         COMMENTARY_WORKER_ACTIVE = True
 
     worker = threading.Thread(target=process_commentary_queue, daemon=True)
     worker.start()
+
+
+def _reset_current_turn() -> None:
+    CURRENT_TURN["player_move"] = None
+    CURRENT_TURN["ai_move"] = None
+    CURRENT_TURN["player_commented"] = False
 
 
 def process_commentary_queue() -> None:
