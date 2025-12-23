@@ -63,19 +63,28 @@ def demo_root():
       let socket;
       let audioContext;
       const pendingTexts = [];
+      const audioChunks = [];
 
       function getSocketUrl() {
         const scheme = window.location.protocol === "https:" ? "wss" : "ws";
         return `${scheme}://${window.location.host}/ws/tts`;
       }
 
-      function playPcm(base64Audio) {
+      function decodeBase64(base64Audio) {
         const binary = atob(base64Audio);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i += 1) {
           bytes[i] = binary.charCodeAt(i);
         }
-        const pcm = new Int16Array(bytes.buffer);
+        return bytes;
+      }
+
+      function playPcmBytes(bytes) {
+        const alignedBuffer = bytes.buffer.slice(
+          bytes.byteOffset,
+          bytes.byteOffset + bytes.byteLength,
+        );
+        const pcm = new Int16Array(alignedBuffer);
         const samples = new Float32Array(pcm.length);
         for (let i = 0; i < pcm.length; i += 1) {
           samples[i] = pcm[i] / 32768;
@@ -89,6 +98,28 @@ def demo_root():
         source.buffer = buffer;
         source.connect(audioContext.destination);
         source.start();
+      }
+
+      function bufferAudio(base64Audio) {
+        audioChunks.push(decodeBase64(base64Audio));
+      }
+
+      function playBufferedAudio() {
+        if (audioChunks.length === 0) {
+          return;
+        }
+        const totalLength = audioChunks.reduce(
+          (total, chunk) => total + chunk.length,
+          0,
+        );
+        const combined = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const chunk of audioChunks) {
+          combined.set(chunk, offset);
+          offset += chunk.length;
+        }
+        audioChunks.length = 0;
+        playPcmBytes(combined);
       }
 
       function ensureSocket() {
@@ -115,7 +146,10 @@ def demo_root():
             return;
           }
           if (message.type === "audio" && message.audio) {
-            playPcm(message.audio);
+            bufferAudio(message.audio);
+          }
+          if (message.type === "end_of_stream") {
+            playBufferedAudio();
           }
         });
         return socket;
