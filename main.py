@@ -1,7 +1,6 @@
 import os
 
 from fastapi import FastAPI
-import uvicorn
 
 app = FastAPI()
 
@@ -24,8 +23,3 @@ def env_check():
         "has_openai_key": bool(os.getenv("OPENAI_API_KEY")),
         "ai_level": ai_level,
     }
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
