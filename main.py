@@ -551,6 +551,291 @@ def ws_test():
     return Response(content=html, media_type="text/html")
 
 
+@app.get("/demo")
+def demo():
+    html = """<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <title>Gradium Chess Demo</title>
+    <style>
+      body {
+        font-family: "Helvetica Neue", Arial, sans-serif;
+        margin: 32px;
+        background: #0f172a;
+        color: #e2e8f0;
+      }
+      h1 {
+        margin-bottom: 8px;
+      }
+      .card {
+        background: #111827;
+        border: 1px solid #1f2937;
+        border-radius: 12px;
+        padding: 16px 20px;
+        margin-top: 16px;
+      }
+      .status {
+        display: inline-block;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        background: #1e293b;
+        margin-left: 8px;
+      }
+      .status.connected {
+        background: #16a34a;
+        color: white;
+      }
+      .log {
+        white-space: pre-wrap;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+          "Courier New", monospace;
+        font-size: 12px;
+        background: #0b1220;
+        border-radius: 8px;
+        padding: 12px;
+        max-height: 200px;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Gradium Chess Demo</h1>
+    <div class="card">
+      <div>Game ID: <span id="game-id">—</span></div>
+      <div>Game URL: <a id="game-url" href="#" target="_blank" rel="noreferrer">—</a></div>
+      <div>
+        SSE: <span id="sse-status" class="status">connecting…</span>
+        TTS: <span id="tts-status" class="status">connecting…</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Commentary log</h3>
+      <div id="log" class="log"></div>
+    </div>
+
+    <script>
+      const logEl = document.getElementById("log");
+      const gameIdEl = document.getElementById("game-id");
+      const gameUrlEl = document.getElementById("game-url");
+      const sseStatusEl = document.getElementById("sse-status");
+      const ttsStatusEl = document.getElementById("tts-status");
+
+      let socket;
+      let ttsReady = false;
+      let speaking = false;
+      let sendLoopActive = false;
+      let lastSentAt = 0;
+
+      let audioContext;
+      let nextAudioTime = 0;
+
+      const ttsQueue = [];
+      let expectedRole = "PLAYER_MOVE";
+      let bufferedPlayer = null;
+      let bufferedAi = null;
+
+      function log(message) {
+        const line = `[${new Date().toLocaleTimeString()}] ${message}\\n`;
+        logEl.textContent = line + logEl.textContent;
+      }
+
+      function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      function getSocketUrl() {
+        const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+        return `${scheme}://${window.location.host}/ws/tts`;
+      }
+
+      function ensureAudioContext() {
+        if (!audioContext) {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+      }
+
+      function schedulePcmPlayback(int16Samples) {
+        ensureAudioContext();
+        const samples = new Float32Array(int16Samples.length);
+        for (let i = 0; i < int16Samples.length; i += 1) {
+          samples[i] = int16Samples[i] / 32768;
+        }
+        const buffer = audioContext.createBuffer(1, samples.length, 24000);
+        buffer.getChannelData(0).set(samples);
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioContext.destination);
+        const startAt = Math.max(audioContext.currentTime, nextAudioTime);
+        source.start(startAt);
+        nextAudioTime = startAt + buffer.duration;
+      }
+
+      function handleSocketMessage(event) {
+        if (typeof event.data === "string") {
+          let message;
+          try {
+            message = JSON.parse(event.data);
+          } catch (error) {
+            return;
+          }
+          if (message.type === "ready") {
+            ttsReady = true;
+            ttsStatusEl.classList.add("connected");
+            ttsStatusEl.textContent = "ready";
+            pumpTtsQueue();
+            return;
+          }
+          if (message.type === "audio" && message.audio) {
+            const binary = atob(message.audio);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i += 1) {
+              bytes[i] = binary.charCodeAt(i);
+            }
+            schedulePcmPlayback(new Int16Array(bytes.buffer));
+            return;
+          }
+          if (message.type === "end_of_stream") {
+            speaking = false;
+            pumpTtsQueue();
+          }
+          return;
+        }
+
+        if (event.data instanceof ArrayBuffer) {
+          schedulePcmPlayback(new Int16Array(event.data));
+        } else if (event.data && event.data.arrayBuffer) {
+          event.data.arrayBuffer().then((buffer) => {
+            schedulePcmPlayback(new Int16Array(buffer));
+          });
+        }
+      }
+
+      function connectSocket() {
+        socket = new WebSocket(getSocketUrl());
+        socket.binaryType = "arraybuffer";
+        socket.addEventListener("open", () => {
+          ttsStatusEl.textContent = "connecting…";
+        });
+        socket.addEventListener("close", () => {
+          ttsReady = false;
+          ttsStatusEl.classList.remove("connected");
+          ttsStatusEl.textContent = "disconnected";
+        });
+        socket.addEventListener("message", handleSocketMessage);
+      }
+
+      function enqueueTts(text, role) {
+        ttsQueue.push({ text, role });
+        log(`${role}: ${text}`);
+        pumpTtsQueue();
+      }
+
+      function flushBuffered() {
+        let flushed = true;
+        while (flushed) {
+          flushed = false;
+          if (expectedRole === "PLAYER_MOVE" && bufferedPlayer) {
+            const payload = bufferedPlayer;
+            bufferedPlayer = null;
+            enqueueTts(payload.text, payload.role);
+            expectedRole = "AI_MOVE";
+            flushed = true;
+          } else if (expectedRole === "AI_MOVE" && bufferedAi) {
+            const payload = bufferedAi;
+            bufferedAi = null;
+            enqueueTts(payload.text, payload.role);
+            expectedRole = "PLAYER_MOVE";
+            flushed = true;
+          }
+        }
+      }
+
+      function handleCommentary(payload) {
+        if (!payload || !payload.text || !payload.role) {
+          return;
+        }
+        if (payload.role === expectedRole) {
+          enqueueTts(payload.text, payload.role);
+          expectedRole = expectedRole === "PLAYER_MOVE" ? "AI_MOVE" : "PLAYER_MOVE";
+          flushBuffered();
+          return;
+        }
+        if (payload.role === "PLAYER_MOVE") {
+          bufferedPlayer = payload;
+        } else if (payload.role === "AI_MOVE") {
+          bufferedAi = payload;
+        }
+      }
+
+      async function pumpTtsQueue() {
+        if (sendLoopActive) {
+          return;
+        }
+        sendLoopActive = true;
+        while (ttsQueue.length > 0) {
+          if (!socket || socket.readyState !== WebSocket.OPEN || !ttsReady) {
+            await sleep(200);
+            continue;
+          }
+          if (speaking) {
+            await sleep(100);
+            continue;
+          }
+          const now = Date.now();
+          const elapsed = now - lastSentAt;
+          if (elapsed < 1000) {
+            await sleep(1000 - elapsed);
+          }
+          const next = ttsQueue.shift();
+          if (!next) {
+            continue;
+          }
+          const payload = { type: "text", text: next.text };
+          socket.send(JSON.stringify(payload));
+          lastSentAt = Date.now();
+          speaking = true;
+        }
+        sendLoopActive = false;
+      }
+
+      async function startDemo() {
+        const response = await fetch("/start-game-demo");
+        const data = await response.json();
+        gameIdEl.textContent = data.game_id || "—";
+        gameUrlEl.textContent = data.game_url || "—";
+        gameUrlEl.href = data.game_url || "#";
+
+        const eventSource = new EventSource(`/events/${data.game_id}`);
+        eventSource.addEventListener("commentary", (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            handleCommentary(payload);
+          } catch (error) {
+            return;
+          }
+        });
+        eventSource.addEventListener("open", () => {
+          sseStatusEl.textContent = "connected";
+          sseStatusEl.classList.add("connected");
+        });
+        eventSource.addEventListener("error", () => {
+          sseStatusEl.textContent = "disconnected";
+          sseStatusEl.classList.remove("connected");
+        });
+      }
+
+      connectSocket();
+      startDemo();
+    </script>
+  </body>
+</html>
+"""
+    return Response(content=html, media_type="text/html")
+
+
 @app.websocket("/ws/tts")
 async def websocket_tts_proxy(websocket: WebSocket):
     await websocket.accept()
