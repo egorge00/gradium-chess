@@ -74,7 +74,7 @@ def demo_root():
       function ensureAudioContext() {
         if (!audioContext) {
           audioContext = new (window.AudioContext || window.webkitAudioContext)({
-            sampleRate: 48000,
+            sampleRate: 24000,
           });
         }
       }
