@@ -20,6 +20,7 @@ COMMENTARY_QUEUE: deque[tuple[str, str]] = deque()
 COMMENTARY_LOCK = threading.Lock()
 COMMENTARY_WORKER_ACTIVE = False
 LAST_LLM_CALL_AT: float | None = None
+LAST_PROCESSED_MOVE_COUNT = 0
 CURRENT_TURN = {
     "player_move": None,
     "ai_move": None,
@@ -113,6 +114,8 @@ def start_game_test(background_tasks: BackgroundTasks):
 
 
 def stream_game_state(game_id: str) -> None:
+    global LAST_PROCESSED_MOVE_COUNT
+
     lichess_token = os.getenv("LICHESS_TOKEN")
     if not lichess_token:
         logger.error("LICHESS_TOKEN not set; cannot stream game")
@@ -125,7 +128,7 @@ def stream_game_state(game_id: str) -> None:
     }
 
     human_color = None
-    last_moves: list[str] = []
+    LAST_PROCESSED_MOVE_COUNT = 0
 
     try:
         with requests.get(
@@ -153,18 +156,20 @@ def stream_game_state(game_id: str) -> None:
                     logger.info("gameFull human_color=%s", human_color)
 
                     initial_moves = event.get("state", {}).get("moves", "")
-                    last_moves = initial_moves.split() if initial_moves else []
+                    initial_moves_list = (
+                        initial_moves.split() if initial_moves else []
+                    )
+                    LAST_PROCESSED_MOVE_COUNT = len(initial_moves_list)
                     continue
 
                 if event_type == "gameState":
                     moves_text = event.get("moves", "")
                     moves = moves_text.split() if moves_text else []
 
-                    if moves[: len(last_moves)] != last_moves:
-                        last_moves = []
-
-                    new_moves = moves[len(last_moves) :]
-                    for index, move in enumerate(new_moves, start=len(last_moves)):
+                    new_moves = moves[LAST_PROCESSED_MOVE_COUNT:]
+                    for index, move in enumerate(
+                        new_moves, start=LAST_PROCESSED_MOVE_COUNT
+                    ):
                         mover_color = "white" if index % 2 == 0 else "black"
                         if mover_color == human_color:
                             logger.info("PLAYER_MOVE move=%s", move)
@@ -172,7 +177,7 @@ def stream_game_state(game_id: str) -> None:
                         else:
                             logger.info("AI_MOVE move=%s", move)
                             enqueue_commentary(move, "AI_MOVE")
-                    last_moves = moves
+                    LAST_PROCESSED_MOVE_COUNT = len(moves)
     except requests.RequestException as exc:
         logger.warning("Lichess stream request failed: %s", exc)
 
