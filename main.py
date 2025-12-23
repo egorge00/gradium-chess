@@ -97,6 +97,9 @@ def stream_game_state(game_id: str) -> None:
         "Accept": "application/json",
     }
 
+    human_color = None
+    last_moves: list[str] = []
+
     with requests.get(stream_url, headers=headers, stream=True, timeout=60) as response:
         response.raise_for_status()
         for line in response.iter_lines():
@@ -107,11 +110,37 @@ def stream_game_state(game_id: str) -> None:
             except json.JSONDecodeError:
                 logger.warning("Failed to decode stream line: %s", line)
                 continue
-            if event.get("type") == "gameState":
+            event_type = event.get("type")
+            if event_type == "gameFull":
+                white_player = event.get("white", {})
+                black_player = event.get("black", {})
+                if "aiLevel" in white_player:
+                    human_color = "black"
+                elif "aiLevel" in black_player:
+                    human_color = "white"
+                else:
+                    human_color = None
+                logger.info("gameFull human_color=%s", human_color)
+
+                initial_moves = event.get("state", {}).get("moves", "")
+                last_moves = initial_moves.split() if initial_moves else []
+                continue
+
+            if event_type == "gameState":
                 moves_text = event.get("moves", "")
                 moves = moves_text.split() if moves_text else []
-                turn = "white" if len(moves) % 2 == 0 else "black"
-                logger.info("gameState moves=%s turn=%s", moves, turn)
+
+                if moves[: len(last_moves)] != last_moves:
+                    last_moves = []
+
+                new_moves = moves[len(last_moves) :]
+                for index, move in enumerate(new_moves, start=len(last_moves)):
+                    mover_color = "white" if index % 2 == 0 else "black"
+                    if mover_color == human_color:
+                        logger.info("PLAYER_MOVE move=%s", move)
+                    else:
+                        logger.info("AI_MOVE move=%s", move)
+                last_moves = moves
 
 
 @app.get("/debug/stream/{game_id}")
