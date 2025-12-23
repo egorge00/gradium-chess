@@ -187,7 +187,7 @@ def debug_gemini_test():
 
     try:
         genai.configure(api_key=gemini_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("models/gemini-pro")
         response = model.generate_content(
             "Dis bonjour en français en une seule phrase."
         )
