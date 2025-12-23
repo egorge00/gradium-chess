@@ -248,16 +248,20 @@ def enqueue_commentary(move_uci: str, role: str) -> None:
 
     with COMMENTARY_LOCK:
         if role == "PLAYER_MOVE":
-            if CURRENT_TURN["player_move"] or CURRENT_TURN["ai_move"]:
+            if CURRENT_TURN["player_move"]:
                 _reset_current_turn()
             CURRENT_TURN["player_move"] = move_uci
             CURRENT_TURN["player_commented"] = True
             COMMENTARY_QUEUE.append((move_uci, role))
+            if CURRENT_TURN["ai_move"]:
+                COMMENTARY_QUEUE.append((CURRENT_TURN["ai_move"], "AI_MOVE"))
+                CURRENT_TURN["ai_commented"] = True
+                _reset_current_turn()
         else:
+            if CURRENT_TURN["ai_move"]:
+                _reset_current_turn()
             CURRENT_TURN["ai_move"] = move_uci
-            if not CURRENT_TURN["player_commented"]:
-                pass
-            else:
+            if CURRENT_TURN["player_commented"]:
                 COMMENTARY_QUEUE.append((move_uci, role))
                 CURRENT_TURN["ai_commented"] = True
                 _reset_current_turn()
