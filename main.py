@@ -6,6 +6,7 @@ import urllib.request
 
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException
+import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -176,6 +177,27 @@ def stream_game_state(game_id: str) -> None:
 def debug_stream(game_id: str, background_tasks: BackgroundTasks):
     background_tasks.add_task(stream_game_state, game_id)
     return {"status": "streaming", "game_id": game_id}
+
+
+@app.get("/debug/gemini-test")
+def debug_gemini_test():
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        return {"error": "GEMINI_API_KEY not set"}
+
+    try:
+        genai.configure(api_key=gemini_key)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(
+            "Dis bonjour en français en une seule phrase."
+        )
+        text = (response.text or "").strip()
+        if not text:
+            return {"error": "Empty response from Gemini"}
+        return {"text": text}
+    except Exception as exc:
+        logger.warning("Gemini test request failed: %s", exc)
+        return {"error": str(exc)}
 
 
 def generate_commentary(move_uci: str, role: str) -> str | None:
