@@ -262,7 +262,7 @@ def debug_gradium_test():
 
     try:
         response = requests.post(
-            "https://api.gradium.ai/v1/tts",
+            "https://api.gradium.ai/v1/tts/synthesize",
             headers={
                 "Authorization": f"Bearer {gradium_key}",
                 "Content-Type": "application/json",
