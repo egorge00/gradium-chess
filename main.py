@@ -12,6 +12,7 @@ from collections import deque
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from gradium.client import GradiumClient
 from google import genai
 
 logging.basicConfig(level=logging.INFO)
@@ -367,7 +368,7 @@ def debug_gradium_test():
 
 
 @app.post("/tts")
-def tts(payload: dict):
+async def tts(payload: dict):
     text = (payload or {}).get("text")
     if not text:
         raise HTTPException(status_code=400, detail="Missing text")
@@ -376,34 +377,25 @@ def tts(payload: dict):
     if not gradium_key:
         raise HTTPException(status_code=500, detail="GRADIUM_API_KEY not set")
 
-    request_payload = {
-        "text": text,
-        "model_name": "default",
-        "voice_id": "YTpq7expH9539ERJ",
-        "output_format": "wav",
-    }
+    client = GradiumClient(api_key=gradium_key)
 
     try:
-        response = requests.post(
-            "https://api.gradium.ai/v1/tts/synthesize",
-            headers={
-                "Authorization": f"Bearer {gradium_key}",
-                "Content-Type": "application/json",
+        result = await client.tts(
+            setup={
+                "model_name": "default",
+                "voice_id": "YTpq7expH9539ERJ",
+                "output_format": "wav",
             },
-            json=request_payload,
-            # TODO: Temporary PoC workaround for Gradium's self-signed SSL cert.
-            verify=False,
-            timeout=30,
+            text=text,
         )
-        response.raise_for_status()
-    except requests.RequestException as exc:
+    except Exception as exc:
         logger.warning("Gradium TTS request failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     audio_id = f"{uuid.uuid4().hex}.wav"
     file_path = os.path.join("/tmp", f"tts_{audio_id}")
     with open(file_path, "wb") as handle:
-        handle.write(response.content)
+        handle.write(result.raw_data)
 
     return {"audio_url": f"/audio/{audio_id}"}
 
