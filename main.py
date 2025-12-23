@@ -33,8 +33,7 @@ def env_check():
     }
 
 
-@app.post("/start-game")
-def start_game(background_tasks: BackgroundTasks):
+def start_game_internal(background_tasks: BackgroundTasks) -> dict:
     lichess_token = os.getenv("LICHESS_TOKEN")
     if not lichess_token:
         raise HTTPException(status_code=500, detail="LICHESS_TOKEN not set")
@@ -83,9 +82,19 @@ def start_game(background_tasks: BackgroundTasks):
     return {"game_id": game_id, "game_url": game_url}
 
 
+@app.post("/start-game")
+def start_game(background_tasks: BackgroundTasks):
+    return start_game_internal(background_tasks)
+
+
+@app.get("/start-game-demo")
+def start_game_demo(background_tasks: BackgroundTasks):
+    return start_game_internal(background_tasks)
+
+
 @app.get("/start-game-test")
 def start_game_test(background_tasks: BackgroundTasks):
-    return start_game(background_tasks)
+    return start_game_internal(background_tasks)
 
 
 def stream_game_state(game_id: str) -> None:
