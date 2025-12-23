@@ -9,6 +9,7 @@ from collections import deque
 
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.responses import JSONResponse, Response
 from google import genai
 
 logging.basicConfig(level=logging.INFO)
@@ -243,6 +244,38 @@ def debug_mistral_test():
         data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
     )
     return {"text": content}
+
+
+@app.get("/debug/gradium-test")
+def debug_gradium_test():
+    gradium_key = os.getenv("GRADIUM_API_KEY")
+    if not gradium_key:
+        return JSONResponse(
+            status_code=500, content={"error": "GRADIUM_API_KEY not set"}
+        )
+
+    payload = {
+        "text": "Salut ! Je suis ton coach d’échecs. Test audio.",
+        "voice_id": "b35yykvVppLXyw_l",
+        "format": "wav",
+    }
+
+    try:
+        response = requests.post(
+            "https://api.gradium.ai/v1/tts",
+            headers={
+                "Authorization": f"Bearer {gradium_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("Gradium TTS request failed: %s", exc)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+    return Response(content=response.content, media_type="audio/wav")
 
 
 def enqueue_commentary(move_uci: str, role: str) -> None:
