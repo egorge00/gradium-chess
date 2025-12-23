@@ -64,6 +64,7 @@ def demo_root():
       let ttsReady = false;
       let audioContext;
       let nextAudioTime = 0;
+      const ttsSampleRate = 16000;
       let firstAudioLogged = false;
 
       function getSocketUrl() {
@@ -74,7 +75,7 @@ def demo_root():
       function ensureAudioContext() {
         if (!audioContext) {
           audioContext = new (window.AudioContext || window.webkitAudioContext)({
-            sampleRate: 24000,
+            sampleRate: ttsSampleRate,
           });
         }
       }
@@ -85,7 +86,7 @@ def demo_root():
         for (let i = 0; i < int16Samples.length; i += 1) {
           samples[i] = int16Samples[i] / 32768;
         }
-        const buffer = audioContext.createBuffer(1, samples.length, 24000);
+        const buffer = audioContext.createBuffer(1, samples.length, ttsSampleRate);
         buffer.getChannelData(0).set(samples);
         const source = audioContext.createBufferSource();
         source.buffer = buffer;
