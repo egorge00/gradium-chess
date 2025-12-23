@@ -200,6 +200,42 @@ def debug_gemini_test():
         return {"error": str(exc)}
 
 
+@app.get("/debug/mistral-test")
+def debug_mistral_test():
+    mistral_key = os.getenv("MISTRAL_API_KEY")
+    if not mistral_key:
+        return {"error": "MISTRAL_API_KEY not set"}
+
+    payload = {
+        "model": "mistral-small-latest",
+        "messages": [
+            {"role": "system", "content": "Tu es un assistant poli."},
+            {"role": "user", "content": "Dis bonjour en français en une seule phrase."},
+        ],
+    }
+
+    try:
+        response = requests.post(
+            "https://api.mistral.ai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {mistral_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("Mistral test request failed: %s", exc)
+        return {"error": str(exc)}
+
+    data = response.json()
+    content = (
+        data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    )
+    return {"text": content}
+
+
 def generate_commentary(move_uci: str, role: str) -> str | None:
     if role not in {"PLAYER_MOVE", "AI_MOVE"}:
         raise ValueError(f"Invalid role: {role}")
