@@ -75,3 +75,8 @@ def start_game():
     )
 
     return {"game_id": game_id, "game_url": game_url}
+
+
+@app.get("/start-game-test")
+def start_game_test():
+    return start_game()
