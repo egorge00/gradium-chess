@@ -1,8 +1,11 @@
 import json
 import logging
 import os
+import threading
+import time
 import urllib.parse
 import urllib.request
+from collections import deque
 
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -12,6 +15,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+COMMENTARY_QUEUE: deque[tuple[str, str]] = deque()
+COMMENTARY_LOCK = threading.Lock()
+COMMENTARY_WORKER_ACTIVE = False
+LAST_LLM_CALL_AT: float | None = None
 
 @app.get("/health")
 def health():
@@ -154,20 +162,10 @@ def stream_game_state(game_id: str) -> None:
                         mover_color = "white" if index % 2 == 0 else "black"
                         if mover_color == human_color:
                             logger.info("PLAYER_MOVE move=%s", move)
-                            commentary = generate_commentary(move, "PLAYER_MOVE")
-                            if commentary:
-                                logger.info(
-                                    'COMMENTARY role=PLAYER_MOVE text="%s"',
-                                    commentary.replace('"', "'"),
-                                )
+                            enqueue_commentary(move, "PLAYER_MOVE")
                         else:
                             logger.info("AI_MOVE move=%s", move)
-                            commentary = generate_commentary(move, "AI_MOVE")
-                            if commentary:
-                                logger.info(
-                                    'COMMENTARY role=AI_MOVE text="%s"',
-                                    commentary.replace('"', "'"),
-                                )
+                            enqueue_commentary(move, "AI_MOVE")
                     last_moves = moves
     except requests.RequestException as exc:
         logger.warning("Lichess stream request failed: %s", exc)
@@ -236,32 +234,67 @@ def debug_mistral_test():
     return {"text": content}
 
 
-def generate_commentary(move_uci: str, role: str) -> str | None:
+def enqueue_commentary(move_uci: str, role: str) -> None:
     if role not in {"PLAYER_MOVE", "AI_MOVE"}:
         raise ValueError(f"Invalid role: {role}")
 
-    openai_key = os.getenv("OPENAI_API_KEY")
-    if not openai_key:
-        logger.warning("OPENAI_API_KEY not set; skipping commentary")
+    global COMMENTARY_WORKER_ACTIVE
+
+    with COMMENTARY_LOCK:
+        COMMENTARY_QUEUE.append((move_uci, role))
+        if COMMENTARY_WORKER_ACTIVE:
+            return
+        COMMENTARY_WORKER_ACTIVE = True
+
+    worker = threading.Thread(target=process_commentary_queue, daemon=True)
+    worker.start()
+
+
+def process_commentary_queue() -> None:
+    global COMMENTARY_WORKER_ACTIVE
+
+    while True:
+        with COMMENTARY_LOCK:
+            if not COMMENTARY_QUEUE:
+                COMMENTARY_WORKER_ACTIVE = False
+                return
+            move_uci, role = COMMENTARY_QUEUE.popleft()
+
+        commentary = generate_commentary_mistral(move_uci, role)
+        if commentary:
+            logger.info(
+                'COMMENTARY role=%s text="%s"',
+                role,
+                commentary.replace('"', "'"),
+            )
+
+
+def generate_commentary_mistral(move_uci: str, role: str) -> str | None:
+    if role not in {"PLAYER_MOVE", "AI_MOVE"}:
+        raise ValueError(f"Invalid role: {role}")
+
+    mistral_key = os.getenv("MISTRAL_API_KEY")
+    if not mistral_key:
+        logger.warning("MISTRAL_API_KEY not set; skipping commentary")
         return None
 
+    throttle_mistral_calls()
+
     payload = {
-        "model": "gpt-4o-mini",
-        "temperature": 0.6,
-        "max_tokens": 120,
+        "model": "mistral-small-latest",
         "messages": [
             {
                 "role": "system",
                 "content": (
                     "Tu es un coach d’échecs calme et pédagogique. "
-                    "Commente le coup donné. 1 phrase (2 max)."
+                    "Tu commentes le coup en maximum deux phrases."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Rôle: {role}. Coup joué (UCI): {move_uci}. "
-                    "Commente ce coup."
+                    f"Rôle: {role}. Coup joué (notation UCI): {move_uci}. "
+                    "Commente ce coup simplement."
                 ),
             },
         ],
@@ -269,9 +302,9 @@ def generate_commentary(move_uci: str, role: str) -> str | None:
 
     try:
         response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
+            "https://api.mistral.ai/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {openai_key}",
+                "Authorization": f"Bearer {mistral_key}",
                 "Content-Type": "application/json",
             },
             json=payload,
@@ -279,7 +312,7 @@ def generate_commentary(move_uci: str, role: str) -> str | None:
         )
         response.raise_for_status()
     except requests.RequestException as exc:
-        logger.warning("OpenAI commentary request failed: %s", exc)
+        logger.warning("Mistral commentary request failed: %s", exc)
         return None
 
     data = response.json()
@@ -287,3 +320,21 @@ def generate_commentary(move_uci: str, role: str) -> str | None:
         data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
     )
     return content or None
+
+
+def throttle_mistral_calls() -> None:
+    global LAST_LLM_CALL_AT
+
+    with COMMENTARY_LOCK:
+        now = time.monotonic()
+        if LAST_LLM_CALL_AT is None:
+            LAST_LLM_CALL_AT = now
+            return
+        elapsed = now - LAST_LLM_CALL_AT
+        if elapsed >= 1.0:
+            LAST_LLM_CALL_AT = now
+            return
+        sleep_for = 1.0 - elapsed
+        LAST_LLM_CALL_AT = now + sleep_for
+
+    time.sleep(sleep_for)
