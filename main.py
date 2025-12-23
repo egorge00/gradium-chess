@@ -570,7 +570,7 @@ async def websocket_tts_proxy(websocket: WebSocket):
     try:
         async with websockets.connect(
             "wss://eu.api.gradium.ai/api/speech/tts",
-            extra_headers={"x-api-key": gradium_key},
+            additional_headers={"x-api-key": gradium_key},
         ) as gradium_ws:
             await gradium_ws.send(json.dumps(setup_payload))
             while True:
