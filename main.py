@@ -1,6 +1,9 @@
+import json
 import os
+import urllib.parse
+import urllib.request
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 app = FastAPI()
 
@@ -23,3 +26,52 @@ def env_check():
         "has_openai_key": bool(os.getenv("OPENAI_API_KEY")),
         "ai_level": ai_level,
     }
+
+
+@app.post("/start-game")
+def start_game():
+    lichess_token = os.getenv("LICHESS_TOKEN")
+    if not lichess_token:
+        raise HTTPException(status_code=500, detail="LICHESS_TOKEN not set")
+
+    ai_level_value = os.getenv("AI_LEVEL", "3")
+    try:
+        ai_level = int(ai_level_value)
+    except ValueError:
+        ai_level = 3
+
+    payload = urllib.parse.urlencode(
+        {
+            "level": ai_level,
+            "clock.limit": 600,
+            "clock.increment": 0,
+            "rated": "false",
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        "https://lichess.org/api/challenge/ai",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {lichess_token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    game_id = (
+        data.get("id")
+        or data.get("game", {}).get("id")
+        or data.get("challenge", {}).get("id")
+    )
+    game_url = (
+        data.get("url")
+        or data.get("game", {}).get("url")
+        or data.get("challenge", {}).get("url")
+    )
+
+    return {"game_id": game_id, "game_url": game_url}
