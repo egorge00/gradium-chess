@@ -447,6 +447,12 @@ def ensure_tts_manager(game_id: str) -> GradiumTTSManager | None:
             voice_ai_id=game_context["voice_ai_id"],
         )
         GAME_TTS_MANAGERS[game_id] = manager
+        logger.info(
+            "TTS manager enabled | game_id=%s | coach_voice=%s | ai_voice=%s",
+            game_id,
+            manager.voice_coach_id,
+            manager.voice_ai_id,
+        )
 
     if APP_LOOP:
         asyncio.run_coroutine_threadsafe(manager.start(), APP_LOOP)
@@ -731,12 +737,46 @@ def process_commentary_queue() -> None:
                 role,
                 commentary.replace('"', "'"),
             )
-            publish_commentary_event(game_id, role, commentary, move_uci)
             manager = ensure_tts_manager(game_id)
-            if manager and APP_LOOP:
-                asyncio.run_coroutine_threadsafe(
+            if not manager:
+                logger.warning(
+                    "No TTS manager for game_id=%s, skipping TTS",
+                    game_id,
+                )
+            elif APP_LOOP:
+                voice_id = (
+                    manager.voice_coach_id
+                    if role == "PLAYER_MOVE"
+                    else manager.voice_ai_id
+                )
+                logger.info(
+                    "TTS speak | game_id=%s | role=%s | voice_id=%s | text_len=%s",
+                    game_id,
+                    role,
+                    voice_id,
+                    len(commentary),
+                )
+                future = asyncio.run_coroutine_threadsafe(
                     manager.speak(role, commentary), APP_LOOP
                 )
+
+                def _handle_tts_result(result_future: asyncio.Future) -> None:
+                    try:
+                        result_future.result()
+                    except Exception:
+                        logger.exception(
+                            "TTS speak failed | game_id=%s | role=%s",
+                            game_id,
+                            role,
+                        )
+
+                future.add_done_callback(_handle_tts_result)
+            else:
+                logger.warning(
+                    "App loop not available; skipping TTS for game_id=%s",
+                    game_id,
+                )
+            publish_commentary_event(game_id, role, commentary, move_uci)
 
 
 def generate_commentary_mistral(move_uci: str, role: str) -> str | None:
