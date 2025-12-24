@@ -122,6 +122,9 @@ def demo_root():
       const button = document.getElementById("start-demo");
       const ttsFeedbackEl = document.getElementById("tts-feedback");
       const playedAudios = new Set();
+      let pendingAiCommentary = null;
+      let isPlaying = false;
+      let lastPlayedRole = null;
 
       function showThinking() {
         ttsFeedbackEl.textContent = "🎧 Le coach réfléchit…";
@@ -143,7 +146,7 @@ def demo_root():
         return response.json();
       }
 
-      async function playTts(text) {
+      async function playTts(text, onEnded) {
         const data = await requestTts(text);
         if (!data || !data.audio_url) {
           return;
@@ -162,8 +165,38 @@ def demo_root():
         });
         audio.addEventListener("ended", () => {
           audio.remove();
+          if (onEnded) {
+            onEnded();
+          }
         });
         document.body.appendChild(audio);
+      }
+
+      function handlePlayerCommentary(payload) {
+        isPlaying = true;
+        showThinking();
+        playTts(payload.text, () => {
+          isPlaying = false;
+          lastPlayedRole = "PLAYER_MOVE";
+          if (pendingAiCommentary) {
+            const pending = pendingAiCommentary;
+            pendingAiCommentary = null;
+            handleAiCommentary(pending);
+          }
+        });
+      }
+
+      function handleAiCommentary(payload) {
+        if (isPlaying || lastPlayedRole !== "PLAYER_MOVE") {
+          pendingAiCommentary = payload;
+          return;
+        }
+        isPlaying = true;
+        showThinking();
+        playTts(payload.text, () => {
+          isPlaying = false;
+          lastPlayedRole = "AI_MOVE";
+        });
       }
 
       async function startDemo() {
@@ -179,9 +212,12 @@ def demo_root():
         eventSource.addEventListener("commentary", (event) => {
           try {
             const payload = JSON.parse(event.data);
-            if (payload && payload.text) {
-              showThinking();
-              playTts(payload.text);
+            if (payload && payload.text && payload.role) {
+              if (payload.role === "PLAYER_MOVE") {
+                handlePlayerCommentary(payload);
+              } else if (payload.role === "AI_MOVE") {
+                handleAiCommentary(payload);
+              }
             }
           } catch (error) {
             return;
@@ -744,9 +780,9 @@ def demo():
       const sseStatusEl = document.getElementById("sse-status");
       const ttsStatusEl = document.getElementById("tts-status");
 
-      let expectedRole = "PLAYER_MOVE";
-      let bufferedPlayer = null;
-      let bufferedAi = null;
+      let pendingAiCommentary = null;
+      let isPlaying = false;
+      let lastPlayedRole = null;
       const playedAudios = new Set();
 
       function log(message) {
@@ -764,11 +800,6 @@ def demo():
         ttsStatusEl.classList.remove("connected");
       }
 
-      function enqueueTts(text, role) {
-        log(`${role}: ${text}`);
-        playTts(text);
-      }
-
       async function requestTts(text) {
         const response = await fetch("/tts", {
           method: "POST",
@@ -781,7 +812,7 @@ def demo():
         return response.json();
       }
 
-      async function playTts(text) {
+      async function playTts(text, onEnded) {
         const data = await requestTts(text);
         if (!data || !data.audio_url) {
           ttsStatusEl.textContent = "error";
@@ -805,45 +836,56 @@ def demo():
           audio.remove();
           ttsStatusEl.textContent = "idle";
           ttsStatusEl.classList.remove("connected");
+          if (onEnded) {
+            onEnded();
+          }
         });
         document.body.appendChild(audio);
       }
 
-      function flushBuffered() {
-        let flushed = true;
-        while (flushed) {
-          flushed = false;
-          if (expectedRole === "PLAYER_MOVE" && bufferedPlayer) {
-            const payload = bufferedPlayer;
-            bufferedPlayer = null;
-            enqueueTts(payload.text, payload.role);
-            expectedRole = "AI_MOVE";
-            flushed = true;
-          } else if (expectedRole === "AI_MOVE" && bufferedAi) {
-            const payload = bufferedAi;
-            bufferedAi = null;
-            enqueueTts(payload.text, payload.role);
-            expectedRole = "PLAYER_MOVE";
-            flushed = true;
-          }
+      function handlePlayerCommentary(payload) {
+        if (!payload || !payload.text) {
+          return;
         }
+        log(`${payload.role}: ${payload.text}`);
+        showThinking();
+        isPlaying = true;
+        playTts(payload.text, () => {
+          isPlaying = false;
+          lastPlayedRole = "PLAYER_MOVE";
+          if (pendingAiCommentary) {
+            const pending = pendingAiCommentary;
+            pendingAiCommentary = null;
+            handleAiCommentary(pending);
+          }
+        });
+      }
+
+      function handleAiCommentary(payload) {
+        if (!payload || !payload.text) {
+          return;
+        }
+        if (isPlaying || lastPlayedRole !== "PLAYER_MOVE") {
+          pendingAiCommentary = payload;
+          return;
+        }
+        log(`${payload.role}: ${payload.text}`);
+        showThinking();
+        isPlaying = true;
+        playTts(payload.text, () => {
+          isPlaying = false;
+          lastPlayedRole = "AI_MOVE";
+        });
       }
 
       function handleCommentary(payload) {
         if (!payload || !payload.text || !payload.role) {
           return;
         }
-        showThinking();
-        if (payload.role === expectedRole) {
-          enqueueTts(payload.text, payload.role);
-          expectedRole = expectedRole === "PLAYER_MOVE" ? "AI_MOVE" : "PLAYER_MOVE";
-          flushBuffered();
-          return;
-        }
         if (payload.role === "PLAYER_MOVE") {
-          bufferedPlayer = payload;
+          handlePlayerCommentary(payload);
         } else if (payload.role === "AI_MOVE") {
-          bufferedAi = payload;
+          handleAiCommentary(payload);
         }
       }
 
