@@ -8,6 +8,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
+from pathlib import Path
 
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -19,6 +20,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
+
+AUDIO_DIR = Path("audio")
 
 COMMENTARY_QUEUE: deque[tuple[str, str, str]] = deque()
 COMMENTARY_LOCK = threading.Lock()
@@ -44,7 +47,12 @@ def health():
 
 @app.on_event("startup")
 async def start_tts_worker():
+    ensure_audio_dir()
     await ensure_tts_worker()
+
+
+def ensure_audio_dir() -> None:
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 async def ensure_tts_worker() -> None:
@@ -61,6 +69,7 @@ async def tts_worker() -> None:
         logger.warning("GRADIUM_API_KEY not set; TTS worker idle")
         return
 
+    ensure_audio_dir()
     client = GradiumClient(api_key=gradium_key)
 
     while True:
@@ -81,9 +90,8 @@ async def tts_worker() -> None:
             continue
 
         audio_id = f"{uuid.uuid4().hex}.wav"
-        file_path = os.path.join("/tmp", f"tts_{audio_id}")
-        with open(file_path, "wb") as handle:
-            handle.write(result.raw_data)
+        file_path = AUDIO_DIR / audio_id
+        file_path.write_bytes(result.raw_data)
 
         if not future.done():
             future.set_result(audio_id)
@@ -446,11 +454,11 @@ def audio(filename: str):
     if safe_name != filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    file_path = os.path.join("/tmp", f"tts_{safe_name}")
-    if not os.path.exists(file_path):
+    file_path = AUDIO_DIR / safe_name
+    if not file_path.is_file():
         raise HTTPException(status_code=404, detail="Audio file not found")
 
-    return FileResponse(file_path, media_type="audio/wav")
+    return FileResponse(str(file_path), media_type="audio/wav")
 
 
 def enqueue_commentary(game_id: str, move_uci: str, role: str) -> None:
