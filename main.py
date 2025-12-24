@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
@@ -349,6 +351,7 @@ class GradiumTTSManager:
         utterance_id: str,
     ) -> None:
         sequence = 0
+        audio_buffer = bytearray()
         while True:
             try:
                 message = await ws.recv()
@@ -375,18 +378,16 @@ class GradiumTTSManager:
                 raw = data.get("audio")
                 if not raw:
                     continue
-                publish_event(
-                    game_id,
-                    "tts-audio",
-                    {
-                        "role": role,
-                        "text": text,
-                        "utterance_id": utterance_id,
-                        "sequence": sequence,
-                        "chunk": raw,
-                    },
-                )
-                logger.info("TTS audio chunk | sequence=%s", sequence)
+                try:
+                    audio_buffer.extend(base64.b64decode(raw))
+                except (binascii.Error, TypeError) as exc:
+                    logger.warning(
+                        "TTS audio chunk decode failed | sequence=%s error=%s",
+                        sequence,
+                        exc,
+                    )
+                else:
+                    logger.info("TTS audio chunk | sequence=%s", sequence)
                 sequence += 1
                 continue
             if message_type in {"done", "end", "final", "eos", "eof", "end_of_stream"}:
@@ -394,6 +395,19 @@ class GradiumTTSManager:
                 break
             if message_type == "error":
                 raise RuntimeError(data.get("message") or "TTS error")
+        logger.info("TTS utterance bytes=%s", len(audio_buffer))
+        if audio_buffer:
+            publish_event(
+                game_id,
+                "tts-audio",
+                {
+                    "role": role,
+                    "text": text,
+                    "utterance_id": utterance_id,
+                    "sequence": sequence,
+                    "chunk": base64.b64encode(bytes(audio_buffer)).decode("ascii"),
+                },
+            )
 
 
 def start_game_internal(
