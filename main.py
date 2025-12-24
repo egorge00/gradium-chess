@@ -12,7 +12,7 @@ from collections import deque
 
 import requests
 import websockets
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google import genai
 
@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-VOICE_COACH = os.getenv("VOICE_COACH_ID")
-VOICE_AI = os.getenv("VOICE_AI_ID")
+DEFAULT_VOICE_COACH_ID = "b35yykvVppLXyw_l"
+DEFAULT_VOICE_AI_ID = "axlOaUiFyOZhy4nv"
 
 COMMENTARY_QUEUE: deque[tuple[str, str, str]] = deque()
 COMMENTARY_LOCK = threading.Lock()
@@ -39,6 +39,8 @@ CURRENT_TURN = {
 }
 GAME_TTS_MANAGERS: dict[str, "GradiumTTSManager"] = {}
 GAME_TTS_LOCK = threading.Lock()
+GAME_CONTEXTS: dict[str, dict] = {}
+GAME_CONTEXTS_LOCK = threading.Lock()
 APP_LOOP: asyncio.AbstractEventLoop | None = None
 
 @app.get("/health")
@@ -221,12 +223,12 @@ class GradiumTTSManager:
         self,
         game_id: str,
         api_key: str,
-        voice_human_id: str,
+        voice_coach_id: str,
         voice_ai_id: str,
     ) -> None:
         self.game_id = game_id
         self.api_key = api_key
-        self.voice_human_id = voice_human_id
+        self.voice_coach_id = voice_coach_id
         self.voice_ai_id = voice_ai_id
         self._queue: asyncio.Queue = asyncio.Queue()
         self._ws: websockets.WebSocketClientProtocol | None = None
@@ -241,7 +243,7 @@ class GradiumTTSManager:
             extra_headers={"Authorization": f"Bearer {self.api_key}"},
             max_size=None,
         )
-        await self._send_setup(self.voice_human_id)
+        await self._send_setup(self.voice_coach_id)
         self._worker_task = asyncio.create_task(self._worker())
 
     async def close(self) -> None:
@@ -293,7 +295,9 @@ class GradiumTTSManager:
     async def _speak_once(self, role: str, text: str) -> None:
         if not self._ws:
             raise RuntimeError("TTS websocket not connected")
-        voice_id = self.voice_human_id if role == "PLAYER_MOVE" else self.voice_ai_id
+        voice_id = (
+            self.voice_coach_id if role == "PLAYER_MOVE" else self.voice_ai_id
+        )
         if voice_id != self._active_voice_id:
             await self._send_setup(voice_id)
         utterance_id = uuid.uuid4().hex
@@ -358,7 +362,11 @@ class GradiumTTSManager:
         )
 
 
-def start_game_internal(background_tasks: BackgroundTasks) -> dict:
+def start_game_internal(
+    background_tasks: BackgroundTasks,
+    voice_coach_id: str,
+    voice_ai_id: str,
+) -> dict:
     lichess_token = os.getenv("LICHESS_TOKEN")
     if not lichess_token:
         raise HTTPException(status_code=500, detail="LICHESS_TOKEN not set")
@@ -402,6 +410,14 @@ def start_game_internal(background_tasks: BackgroundTasks) -> dict:
 
     game_url = f"https://lichess.org/{game_id}"
 
+    game_context = {
+        "game_id": game_id,
+        "voice_coach_id": voice_coach_id,
+        "voice_ai_id": voice_ai_id,
+    }
+    with GAME_CONTEXTS_LOCK:
+        GAME_CONTEXTS[game_id] = game_context
+
     background_tasks.add_task(stream_game_state, game_id)
     ensure_tts_manager(game_id)
 
@@ -413,8 +429,11 @@ def ensure_tts_manager(game_id: str) -> GradiumTTSManager | None:
     if not gradium_key:
         logger.warning("GRADIUM_API_KEY not set; skipping TTS manager")
         return None
-    if not VOICE_COACH or not VOICE_AI:
-        logger.warning("VOICE_COACH_ID or VOICE_AI_ID not set; skipping TTS manager")
+
+    with GAME_CONTEXTS_LOCK:
+        game_context = GAME_CONTEXTS.get(game_id)
+    if not game_context:
+        logger.warning("Missing game context for game_id=%s", game_id)
         return None
 
     with GAME_TTS_LOCK:
@@ -424,8 +443,8 @@ def ensure_tts_manager(game_id: str) -> GradiumTTSManager | None:
         manager = GradiumTTSManager(
             game_id=game_id,
             api_key=gradium_key,
-            voice_human_id=VOICE_COACH,
-            voice_ai_id=VOICE_AI,
+            voice_coach_id=game_context["voice_coach_id"],
+            voice_ai_id=game_context["voice_ai_id"],
         )
         GAME_TTS_MANAGERS[game_id] = manager
 
@@ -439,23 +458,45 @@ def ensure_tts_manager(game_id: str) -> GradiumTTSManager | None:
 def shutdown_tts_manager(game_id: str) -> None:
     with GAME_TTS_LOCK:
         manager = GAME_TTS_MANAGERS.pop(game_id, None)
+    with GAME_CONTEXTS_LOCK:
+        GAME_CONTEXTS.pop(game_id, None)
     if manager and APP_LOOP:
         asyncio.run_coroutine_threadsafe(manager.close(), APP_LOOP)
 
 
 @app.post("/start-game")
 def start_game(background_tasks: BackgroundTasks):
-    return start_game_internal(background_tasks)
+    return start_game_internal(
+        background_tasks,
+        DEFAULT_VOICE_COACH_ID,
+        DEFAULT_VOICE_AI_ID,
+    )
 
 
 @app.get("/start-game-demo")
-def start_game_demo(background_tasks: BackgroundTasks):
-    return start_game_internal(background_tasks)
+def start_game_demo(background_tasks: BackgroundTasks, request: Request):
+    voice_coach_id = request.query_params.get(
+        "voice_coach",
+        DEFAULT_VOICE_COACH_ID,
+    )
+    voice_ai_id = request.query_params.get(
+        "voice_ai",
+        DEFAULT_VOICE_AI_ID,
+    )
+    return start_game_internal(
+        background_tasks,
+        voice_coach_id,
+        voice_ai_id,
+    )
 
 
 @app.get("/start-game-test")
 def start_game_test(background_tasks: BackgroundTasks):
-    return start_game_internal(background_tasks)
+    return start_game_internal(
+        background_tasks,
+        DEFAULT_VOICE_COACH_ID,
+        DEFAULT_VOICE_AI_ID,
+    )
 
 
 def stream_game_state(game_id: str) -> None:
