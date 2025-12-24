@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -44,7 +43,7 @@ TTS_MANAGER_LOCK = threading.Lock()
 GAME_CONTEXTS: dict[str, dict] = {}
 GAME_CONTEXTS_LOCK = threading.Lock()
 APP_LOOP: asyncio.AbstractEventLoop | None = None
-GRADIUM_WS_SEMAPHORE = asyncio.Semaphore(1)
+TTS_THROTTLE_SECONDS = 1.0
 
 @app.get("/health")
 def health():
@@ -224,41 +223,8 @@ def env_check():
 class GradiumTTSManager:
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._ws: websockets.WebSocketClientProtocol | None = None
-        self._worker_task: asyncio.Task | None = None
-        self._active_voice_id: str | None = None
+        self._lock = asyncio.Lock()
         self._last_tts_sent_at = 0.0
-        self._reconnect_attempted = False
-        self._semaphore_acquired = False
-
-    async def start(self) -> None:
-        if self._worker_task:
-            return
-        if GRADIUM_WS_SEMAPHORE.locked():
-            logger.info("TTS waiting for semaphore")
-        await GRADIUM_WS_SEMAPHORE.acquire()
-        self._semaphore_acquired = True
-        try:
-            await self._ensure_connected()
-        except Exception:
-            GRADIUM_WS_SEMAPHORE.release()
-            self._semaphore_acquired = False
-            raise
-        self._worker_task = asyncio.create_task(self._worker())
-
-    async def close(self) -> None:
-        try:
-            if self._worker_task:
-                await self._queue.put(None)
-                await self._worker_task
-            if self._ws:
-                await self._ws.close()
-                self._ws = None
-        finally:
-            if self._semaphore_acquired:
-                GRADIUM_WS_SEMAPHORE.release()
-                self._semaphore_acquired = False
 
     async def speak(self, game_id: str, role: str, text: str) -> None:
         if role not in {"PLAYER_MOVE", "AI_MOVE"}:
@@ -266,124 +232,53 @@ class GradiumTTSManager:
         voice_id = get_voice_id_for_game(game_id, role)
         if not voice_id:
             raise RuntimeError("Missing voice id for TTS")
-        if not self._worker_task:
-            await self.start()
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        await self._queue.put((game_id, role, text, voice_id, future))
-        await future
+        async with self._lock:
+            await self._throttle()
+            await self._speak_once(game_id, role, text, voice_id)
 
-    async def _ensure_connected(self) -> None:
-        if self._ws is not None:
-            return
-        self._ws = None
-        if self._reconnect_attempted:
-            raise RuntimeError("TTS websocket closed; reconnect already attempted")
-        self._reconnect_attempted = True
-        logger.info("TTS connecting")
-        self._ws = await websockets.connect(
-            "wss://eu.api.gradium.ai/api/speech/tts",
-            additional_headers={"x-api-key": self.api_key},
-            max_size=None,
-        )
-        self._active_voice_id = None
-        self._reconnect_attempted = False
+    async def _throttle(self) -> None:
+        elapsed = time.monotonic() - self._last_tts_sent_at
+        if elapsed < TTS_THROTTLE_SECONDS:
+            await asyncio.sleep(TTS_THROTTLE_SECONDS - elapsed)
+        self._last_tts_sent_at = time.monotonic()
 
-    async def _send_setup(self, voice_id: str) -> None:
-        if not self._ws:
-            raise RuntimeError("TTS websocket not connected")
-        payload = {
-            "type": "setup",
-            "model_name": "default",
-            "voice_id": voice_id,
-            "output_format": "wav",
-        }
-        await self._ws.send(json.dumps(payload))
-        logger.info("TTS setup sent | voice_id=%s", voice_id)
-        await self._await_ready()
-        self._active_voice_id = voice_id
-
-    async def _await_ready(self) -> None:
-        if not self._ws:
-            raise RuntimeError("TTS websocket not connected")
-        while True:
-            message = await self._ws.recv()
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                continue
-            message_type = data.get("type")
-            if message_type == "ready":
-                logger.info("TTS ready")
-                return
-            if message_type == "error":
-                raise RuntimeError(data.get("message") or "TTS error")
-
-    async def _worker(self) -> None:
-        while True:
-            item = await self._queue.get()
-            if item is None:
-                break
-            game_id, role, text, voice_id, future = item
-            try:
-                elapsed = time.monotonic() - self._last_tts_sent_at
-                if elapsed < 1.0:
-                    await asyncio.sleep(1.0 - elapsed)
-                self._last_tts_sent_at = time.monotonic()
-                await self._speak_once(game_id, role, text, voice_id)
-            except Exception as exc:
-                logger.warning("TTS speak failed: %s", exc)
-                if not future.done():
-                    future.set_exception(exc)
-            else:
-                if not future.done():
-                    future.set_result(True)
-
-    async def _speak_once(
-        self, game_id: str, role: str, text: str, voice_id: str
-    ) -> None:
+    async def _speak_once(self, game_id: str, role: str, text: str, voice_id: str) -> None:
         utterance_id = uuid.uuid4().hex
         publish_event(
             game_id,
             "tts-start",
             {"role": role, "text": text, "utterance_id": utterance_id},
         )
-        last_exc: Exception | None = None
-        for attempt in range(2):
-            try:
-                await self._ensure_connected()
-                if voice_id != self._active_voice_id:
-                    await self._send_setup(voice_id)
-                if not self._ws:
-                    raise RuntimeError("TTS websocket not connected")
-                await self._ws.send(json.dumps({"type": "text", "text": text}))
-                await self._ws.send(json.dumps({"type": "end_of_stream"}))
-                await self._stream_audio(game_id, role, text, utterance_id)
-                return
-            except Exception as exc:
-                last_exc = exc
-                logger.warning("TTS websocket error; reconnecting: %s", exc)
-                if self._ws:
-                    try:
-                        await self._ws.close()
-                    except Exception:
-                        pass
-                self._ws = None
-                self._active_voice_id = None
-                if attempt == 0:
-                    continue
-                raise
-        if last_exc:
-            raise last_exc
+        logger.info("TTS connecting")
+        async with websockets.connect(
+            "wss://eu.api.gradium.ai/api/speech/tts",
+            additional_headers={"x-api-key": self.api_key},
+            max_size=None,
+        ) as ws:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "setup",
+                        "model_name": "default",
+                        "voice_id": voice_id,
+                        "output_format": "wav",
+                    }
+                )
+            )
+            await ws.send(json.dumps({"type": "text", "text": text, "flush": True}))
+            await self._stream_audio(ws, game_id, role, text, utterance_id)
 
     async def _stream_audio(
-        self, game_id: str, role: str, text: str, utterance_id: str
+        self,
+        ws: websockets.WebSocketClientProtocol,
+        game_id: str,
+        role: str,
+        text: str,
+        utterance_id: str,
     ) -> None:
-        if not self._ws:
-            raise RuntimeError("TTS websocket not connected")
         sequence = 0
         while True:
-            message = await self._ws.recv()
+            message = await ws.recv()
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
@@ -393,7 +288,6 @@ class GradiumTTSManager:
                 raw = data.get("audio")
                 if not raw:
                     continue
-                chunk = base64.b64decode(raw)
                 publish_event(
                     game_id,
                     "tts-audio",
@@ -402,13 +296,13 @@ class GradiumTTSManager:
                         "text": text,
                         "utterance_id": utterance_id,
                         "sequence": sequence,
-                        "chunk": base64.b64encode(chunk).decode("ascii"),
+                        "chunk": raw,
                     },
                 )
                 logger.info("TTS audio chunk | sequence=%s", sequence)
                 sequence += 1
                 continue
-            if message_type == "end_of_stream":
+            if message_type in {"end", "end_of_stream", "done"}:
                 logger.info("TTS eos")
                 break
             if message_type == "error":
@@ -495,10 +389,6 @@ def ensure_tts_manager() -> GradiumTTSManager | None:
         TTS_MANAGER = GradiumTTSManager(api_key=gradium_key)
         logger.info("TTS manager enabled")
 
-    if APP_LOOP:
-        asyncio.run_coroutine_threadsafe(TTS_MANAGER.start(), APP_LOOP)
-    else:
-        logger.warning("App loop not available; cannot start TTS manager")
     return TTS_MANAGER
 
 
@@ -507,10 +397,7 @@ def shutdown_tts_manager(game_id: str) -> None:
         GAME_CONTEXTS.pop(game_id, None)
     with TTS_MANAGER_LOCK:
         global TTS_MANAGER
-        manager = TTS_MANAGER
         TTS_MANAGER = None
-    if manager and APP_LOOP:
-        asyncio.run_coroutine_threadsafe(manager.close(), APP_LOOP)
 
 
 def get_voice_id_for_game(game_id: str, role: str) -> str:
