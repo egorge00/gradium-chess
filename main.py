@@ -269,6 +269,7 @@ class GradiumTTSManager:
             raise RuntimeError("TTS websocket not connected")
         payload = {
             "type": "setup",
+            "api_key": self.api_key,
             "model_name": "default",
             "voice_id": voice_id,
             "output_format": "wav",
