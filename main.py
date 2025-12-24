@@ -38,6 +38,8 @@ CURRENT_TURN = {
     "player_commented": False,
     "ai_commented": False,
 }
+TTS_LOCK = asyncio.Lock()
+LAST_TTS_CALL_AT: float | None = None
 
 @app.get("/health")
 def health():
@@ -529,18 +531,20 @@ async def tts(payload: dict):
 
     ensure_audio_dir()
     client = GradiumClient(api_key=gradium_key)
-    try:
-        result = await client.tts(
-            setup={
-                "model_name": "default",
-                "voice_id": voice_id,
-                "output_format": "wav",
-            },
-            text=text,
-        )
-    except Exception as exc:
-        logger.warning("Gradium TTS request failed: %s", exc)
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    async with TTS_LOCK:
+        await throttle_tts_calls()
+        try:
+            result = await client.tts(
+                setup={
+                    "model_name": "default",
+                    "voice_id": voice_id,
+                    "output_format": "wav",
+                },
+                text=text,
+            )
+        except Exception as exc:
+            logger.warning("Gradium TTS request failed: %s", exc)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     audio_id = f"{uuid.uuid4().hex}.wav"
     file_path = AUDIO_DIR / audio_id
@@ -751,6 +755,20 @@ def throttle_mistral_calls() -> None:
         LAST_LLM_CALL_AT = now + sleep_for
 
     time.sleep(sleep_for)
+
+
+async def throttle_tts_calls() -> None:
+    global LAST_TTS_CALL_AT
+
+    now = time.monotonic()
+    if LAST_TTS_CALL_AT is None:
+        LAST_TTS_CALL_AT = now
+        return
+    elapsed = now - LAST_TTS_CALL_AT
+    delay = max(0.0, 1.0 - elapsed)
+    if delay:
+        await asyncio.sleep(delay)
+    LAST_TTS_CALL_AT = time.monotonic()
 
 
 def get_commentary_queue(game_id: str) -> asyncio.Queue:
