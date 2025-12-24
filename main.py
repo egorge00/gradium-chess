@@ -83,6 +83,7 @@ def demo_root():
       let isPlaying = false;
       let lastPlayedRole = null;
       let currentEntry = null;
+      let pendingTtsCount = 0;
       const audioPlayer = new Audio();
       audioPlayer.preload = "auto";
 
@@ -92,6 +93,18 @@ def demo_root():
 
       function clearThinking() {
         ttsFeedbackEl.textContent = "";
+      }
+
+      function markTtsPending() {
+        pendingTtsCount += 1;
+        showThinking();
+      }
+
+      function markTtsComplete() {
+        pendingTtsCount = Math.max(0, pendingTtsCount - 1);
+        if (pendingTtsCount === 0) {
+          clearThinking();
+        }
       }
 
       async function requestTts(text, role) {
@@ -113,6 +126,7 @@ def demo_root():
           audioUrl: null,
           audioPromise: null,
         };
+        markTtsPending();
         entry.audioPromise = requestTts(payload.text, payload.role)
           .then((data) => {
             if (!data || !data.audio_url) {
@@ -121,7 +135,8 @@ def demo_root():
             entry.audioUrl = data.audio_url;
             return data.audio_url;
           })
-          .catch(() => null);
+          .catch(() => null)
+          .finally(() => markTtsComplete());
         return entry;
       }
 
@@ -134,10 +149,8 @@ def demo_root():
           return;
         }
         isPlaying = true;
-        showThinking();
         const audioUrl = await entry.audioPromise;
         if (!audioUrl || playedAudios.has(audioUrl)) {
-          clearThinking();
           isPlaying = false;
           if (entry.role === "PLAYER_MOVE" && pendingAiEntry) {
             audioQueue.push(pendingAiEntry);
@@ -150,7 +163,6 @@ def demo_root():
         currentEntry = entry;
         const handleCanPlay = () => {
           audioPlayer.removeEventListener("canplay", handleCanPlay);
-          clearThinking();
           audioPlayer.play().catch(() => {
             isPlaying = false;
             currentEntry = null;
@@ -860,6 +872,7 @@ def demo():
       let isPlaying = false;
       let lastPlayedRole = null;
       const playedAudios = new Set();
+      let pendingTtsCount = 0;
 
       function log(message) {
         const line = `[${new Date().toLocaleTimeString()}] ${message}\\n`;
@@ -876,11 +889,23 @@ def demo():
         ttsStatusEl.classList.remove("connected");
       }
 
-      async function requestTts(text) {
+      function markTtsPending() {
+        pendingTtsCount += 1;
+        showThinking();
+      }
+
+      function markTtsComplete() {
+        pendingTtsCount = Math.max(0, pendingTtsCount - 1);
+        if (pendingTtsCount === 0) {
+          clearThinking();
+        }
+      }
+
+      async function requestTts(text, role) {
         const response = await fetch("/tts", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text }),
+          body: JSON.stringify({ text, role }),
         });
         if (!response.ok) {
           return null;
@@ -895,7 +920,8 @@ def demo():
           audioUrl: null,
           audioPromise: null,
         };
-        entry.audioPromise = requestTts(payload.text)
+        markTtsPending();
+        entry.audioPromise = requestTts(payload.text, payload.role)
           .then((data) => {
             if (!data || !data.audio_url) {
               return null;
@@ -903,7 +929,8 @@ def demo():
             entry.audioUrl = data.audio_url;
             return data.audio_url;
           })
-          .catch(() => null);
+          .catch(() => null)
+          .finally(() => markTtsComplete());
         return entry;
       }
 
@@ -916,10 +943,8 @@ def demo():
           return;
         }
         isPlaying = true;
-        showThinking();
         const audioUrl = await entry.audioPromise;
         if (!audioUrl || playedAudios.has(audioUrl)) {
-          clearThinking();
           ttsStatusEl.textContent = audioUrl ? "idle" : "error";
           ttsStatusEl.classList.remove("connected");
           isPlaying = false;
