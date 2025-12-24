@@ -23,6 +23,9 @@ app = FastAPI()
 COMMENTARY_QUEUE: deque[tuple[str, str, str]] = deque()
 COMMENTARY_LOCK = threading.Lock()
 COMMENTARY_WORKER_ACTIVE = False
+TTS_QUEUE: asyncio.Queue[tuple[str, asyncio.Future]] = asyncio.Queue()
+TTS_WORKER_TASK: asyncio.Task | None = None
+TTS_WORKER_LOCK = asyncio.Lock()
 LAST_LLM_CALL_AT: float | None = None
 LAST_PROCESSED_MOVE_COUNT = 0
 COMMENTARY_SUBSCRIBERS: dict[str, dict] = {}
@@ -37,6 +40,53 @@ CURRENT_TURN = {
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.on_event("startup")
+async def start_tts_worker():
+    await ensure_tts_worker()
+
+
+async def ensure_tts_worker() -> None:
+    global TTS_WORKER_TASK
+    async with TTS_WORKER_LOCK:
+        if TTS_WORKER_TASK and not TTS_WORKER_TASK.done():
+            return
+        TTS_WORKER_TASK = asyncio.create_task(tts_worker())
+
+
+async def tts_worker() -> None:
+    gradium_key = os.getenv("GRADIUM_API_KEY")
+    if not gradium_key:
+        logger.warning("GRADIUM_API_KEY not set; TTS worker idle")
+        return
+
+    client = GradiumClient(api_key=gradium_key)
+
+    while True:
+        text, future = await TTS_QUEUE.get()
+        try:
+            result = await client.tts(
+                setup={
+                    "model_name": "default",
+                    "voice_id": "YTpq7expH9539ERJ",
+                    "output_format": "wav",
+                },
+                text=text,
+            )
+        except Exception as exc:
+            logger.warning("Gradium TTS request failed: %s", exc)
+            if not future.done():
+                future.set_exception(exc)
+            continue
+
+        audio_id = f"{uuid.uuid4().hex}.wav"
+        file_path = os.path.join("/tmp", f"tts_{audio_id}")
+        with open(file_path, "wb") as handle:
+            handle.write(result.raw_data)
+
+        if not future.done():
+            future.set_result(audio_id)
 
 
 @app.get("/")
@@ -377,25 +427,15 @@ async def tts(payload: dict):
     if not gradium_key:
         raise HTTPException(status_code=500, detail="GRADIUM_API_KEY not set")
 
-    client = GradiumClient(api_key=gradium_key)
+    await ensure_tts_worker()
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    await TTS_QUEUE.put((text, future))
 
     try:
-        result = await client.tts(
-            setup={
-                "model_name": "default",
-                "voice_id": "YTpq7expH9539ERJ",
-                "output_format": "wav",
-            },
-            text=text,
-        )
+        audio_id = await future
     except Exception as exc:
-        logger.warning("Gradium TTS request failed: %s", exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    audio_id = f"{uuid.uuid4().hex}.wav"
-    file_path = os.path.join("/tmp", f"tts_{audio_id}")
-    with open(file_path, "wb") as handle:
-        handle.write(result.raw_data)
 
     return {"audio_url": f"/audio/{audio_id}"}
 
