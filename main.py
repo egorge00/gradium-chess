@@ -82,15 +82,16 @@ def demo_root():
     <script>
       const button = document.getElementById("start-demo");
       const ttsFeedbackEl = document.getElementById("tts-feedback");
-      const audioQueue = [];
-      let isPlaying = false;
       let pendingTtsCount = 0;
       const ttsWatchdogs = new Map();
       const ttsPendingIds = new Set();
       let ttsWatchdogCounter = 0;
       const TTS_WATCHDOG_MS = 15000;
       let audioContext = null;
-      let decodeChain = Promise.resolve();
+      let nextPlaybackTime = 0;
+      const ttsChunkQueue = [];
+      let isDrainingQueue = false;
+      const PCM_SAMPLE_RATE = 24000;
 
       function ensureAudioContext() {
         if (!audioContext) {
@@ -99,22 +100,9 @@ def demo_root():
         if (audioContext.state === "suspended") {
           audioContext.resume().catch(() => {});
         }
-      }
-
-      function base64ToPcmSamples(base64) {
-        const binary = atob(base64);
-        const buffer = new ArrayBuffer(binary.length);
-        const bytes = new Uint8Array(buffer);
-        for (let i = 0; i < binary.length; i += 1) {
-          bytes[i] = binary.charCodeAt(i);
+        if (audioContext.state !== "running") {
+          audioContext.resume().catch(() => {});
         }
-        const sampleCount = Math.floor(buffer.byteLength / 2);
-        const samples = new Float32Array(sampleCount);
-        const view = new DataView(buffer);
-        for (let i = 0; i < sampleCount; i += 1) {
-          samples[i] = view.getInt16(i * 2, true) / 32768;
-        }
-        return samples;
       }
 
       function showThinking() {
@@ -169,37 +157,64 @@ def demo_root():
         }
       }
 
-      async function playNextAudio() {
-        if (isPlaying) {
-          return;
+      function decodeBase64ToFloat32(base64Chunk) {
+        const binary = atob(base64Chunk);
+        const buffer = new ArrayBuffer(binary.length);
+        const bytes = new Uint8Array(buffer);
+        for (let i = 0; i < binary.length; i += 1) {
+          bytes[i] = binary.charCodeAt(i);
         }
-        const buffer = audioQueue.shift();
-        if (!buffer) {
-          return;
+        const int16View = new DataView(buffer);
+        const sampleCount = Math.floor(buffer.byteLength / 2);
+        const samples = new Float32Array(sampleCount);
+        for (let i = 0; i < sampleCount; i += 1) {
+          samples[i] = int16View.getInt16(i * 2, true) / 32768;
         }
+        return samples;
+      }
+
+      function scheduleAudioBuffer(buffer) {
         ensureAudioContext();
+        const startAt = Math.max(audioContext.currentTime, nextPlaybackTime);
         const source = audioContext.createBufferSource();
         source.buffer = buffer;
         source.connect(audioContext.destination);
-        isPlaying = true;
-        source.addEventListener("ended", () => {
-          isPlaying = false;
-          playNextAudio();
-        });
-        source.start();
+        source.start(startAt);
+        nextPlaybackTime = startAt + buffer.duration;
+      }
+
+      function drainTtsQueue() {
+        if (isDrainingQueue) {
+          return;
+        }
+        isDrainingQueue = true;
+        ensureAudioContext();
+        if (nextPlaybackTime < audioContext.currentTime) {
+          nextPlaybackTime = audioContext.currentTime;
+        }
+        while (ttsChunkQueue.length > 0) {
+          const chunk = ttsChunkQueue.shift();
+          const samples = decodeBase64ToFloat32(chunk);
+          const buffer = audioContext.createBuffer(
+            1,
+            samples.length,
+            PCM_SAMPLE_RATE
+          );
+          buffer.copyToChannel(samples, 0);
+          // FIFO scheduling avoids destructive overlaps without relying on "ended".
+          scheduleAudioBuffer(buffer);
+        }
+        isDrainingQueue = false;
+      }
+
+      function handleTtsChunk(base64Chunk) {
+        ttsChunkQueue.push(base64Chunk);
+        drainTtsQueue();
       }
 
       function enqueueAudioChunk(chunk) {
         ensureAudioContext();
-        decodeChain = decodeChain
-          .then(() => {
-            const samples = base64ToPcmSamples(chunk);
-            const buffer = audioContext.createBuffer(1, samples.length, 24000);
-            buffer.copyToChannel(samples, 0);
-            audioQueue.push(buffer);
-            playNextAudio();
-          })
-          .catch(() => {});
+        handleTtsChunk(chunk);
       }
 
       async function startDemo() {
