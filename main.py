@@ -240,7 +240,7 @@ class GradiumTTSManager:
             return
         self._ws = await websockets.connect(
             "wss://eu.api.gradium.ai/api/speech/tts",
-            extra_headers={"Authorization": f"Bearer {self.api_key}"},
+            additional_headers={"Authorization": f"Bearer {self.api_key}"},
             max_size=None,
         )
         await self._send_setup(self.voice_coach_id)
