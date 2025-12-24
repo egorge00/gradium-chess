@@ -80,6 +80,9 @@ def demo_root():
       let pendingAiEntry = null;
       let isPlaying = false;
       let lastPlayedRole = null;
+      let currentEntry = null;
+      const audioPlayer = new Audio();
+      audioPlayer.preload = "auto";
 
       function showThinking() {
         ttsFeedbackEl.textContent = "🎧 Le coach réfléchit…";
@@ -142,25 +145,53 @@ def demo_root():
           return;
         }
         playedAudios.add(audioUrl);
-        const audio = document.createElement("audio");
-        audio.src = audioUrl;
-        audio.autoplay = true;
-        audio.style.display = "none";
-        audio.addEventListener("play", () => {
+        currentEntry = entry;
+        const handleCanPlay = () => {
+          audioPlayer.removeEventListener("canplay", handleCanPlay);
           clearThinking();
-        });
-        audio.addEventListener("ended", () => {
-          audio.remove();
-          isPlaying = false;
-          lastPlayedRole = entry.role;
-          if (entry.role === "PLAYER_MOVE" && pendingAiEntry) {
-            audioQueue.push(pendingAiEntry);
-            pendingAiEntry = null;
-          }
-          playNextAudio();
-        });
-        document.body.appendChild(audio);
+          audioPlayer.play().catch(() => {
+            isPlaying = false;
+            currentEntry = null;
+            if (entry.role === "PLAYER_MOVE" && pendingAiEntry) {
+              audioQueue.push(pendingAiEntry);
+              pendingAiEntry = null;
+            }
+            playNextAudio();
+          });
+        };
+        audioPlayer.addEventListener("canplay", handleCanPlay);
+        audioPlayer.src = audioUrl;
+        audioPlayer.load();
       }
+
+      audioPlayer.addEventListener("ended", () => {
+        if (!currentEntry) {
+          return;
+        }
+        const finishedEntry = currentEntry;
+        currentEntry = null;
+        isPlaying = false;
+        lastPlayedRole = finishedEntry.role;
+        if (finishedEntry.role === "PLAYER_MOVE" && pendingAiEntry) {
+          audioQueue.push(pendingAiEntry);
+          pendingAiEntry = null;
+        }
+        playNextAudio();
+      });
+
+      audioPlayer.addEventListener("error", () => {
+        if (!currentEntry) {
+          return;
+        }
+        const failedEntry = currentEntry;
+        currentEntry = null;
+        isPlaying = false;
+        if (failedEntry.role === "PLAYER_MOVE" && pendingAiEntry) {
+          audioQueue.push(pendingAiEntry);
+          pendingAiEntry = null;
+        }
+        playNextAudio();
+      });
 
       function handlePlayerCommentary(payload) {
         const entry = createAudioEntry(payload);
