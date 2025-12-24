@@ -122,7 +122,8 @@ def demo_root():
       const button = document.getElementById("start-demo");
       const ttsFeedbackEl = document.getElementById("tts-feedback");
       const playedAudios = new Set();
-      let pendingAiCommentary = null;
+      const audioQueue = [];
+      let pendingAiEntry = null;
       let isPlaying = false;
       let lastPlayedRole = null;
 
@@ -146,18 +147,49 @@ def demo_root():
         return response.json();
       }
 
-      async function playTts(text, onEnded) {
-        const data = await requestTts(text);
-        if (!data || !data.audio_url) {
+      function createAudioEntry(payload) {
+        const entry = {
+          role: payload.role,
+          text: payload.text,
+          audioUrl: null,
+          audioPromise: null,
+        };
+        entry.audioPromise = requestTts(payload.text)
+          .then((data) => {
+            if (!data || !data.audio_url) {
+              return null;
+            }
+            entry.audioUrl = data.audio_url;
+            return data.audio_url;
+          })
+          .catch(() => null);
+        return entry;
+      }
+
+      async function playNextAudio() {
+        if (isPlaying) {
           return;
         }
-        if (playedAudios.has(data.audio_url)) {
+        const entry = audioQueue.shift();
+        if (!entry) {
+          return;
+        }
+        isPlaying = true;
+        showThinking();
+        const audioUrl = await entry.audioPromise;
+        if (!audioUrl || playedAudios.has(audioUrl)) {
           clearThinking();
+          isPlaying = false;
+          if (entry.role === "PLAYER_MOVE" && pendingAiEntry) {
+            audioQueue.push(pendingAiEntry);
+            pendingAiEntry = null;
+          }
+          playNextAudio();
           return;
         }
-        playedAudios.add(data.audio_url);
+        playedAudios.add(audioUrl);
         const audio = document.createElement("audio");
-        audio.src = data.audio_url;
+        audio.src = audioUrl;
         audio.autoplay = true;
         audio.style.display = "none";
         audio.addEventListener("play", () => {
@@ -165,38 +197,31 @@ def demo_root():
         });
         audio.addEventListener("ended", () => {
           audio.remove();
-          if (onEnded) {
-            onEnded();
+          isPlaying = false;
+          lastPlayedRole = entry.role;
+          if (entry.role === "PLAYER_MOVE" && pendingAiEntry) {
+            audioQueue.push(pendingAiEntry);
+            pendingAiEntry = null;
           }
+          playNextAudio();
         });
         document.body.appendChild(audio);
       }
 
       function handlePlayerCommentary(payload) {
-        isPlaying = true;
-        showThinking();
-        playTts(payload.text, () => {
-          isPlaying = false;
-          lastPlayedRole = "PLAYER_MOVE";
-          if (pendingAiCommentary) {
-            const pending = pendingAiCommentary;
-            pendingAiCommentary = null;
-            handleAiCommentary(pending);
-          }
-        });
+        const entry = createAudioEntry(payload);
+        audioQueue.push(entry);
+        playNextAudio();
       }
 
       function handleAiCommentary(payload) {
+        const entry = createAudioEntry(payload);
         if (isPlaying || lastPlayedRole !== "PLAYER_MOVE") {
-          pendingAiCommentary = payload;
+          pendingAiEntry = entry;
           return;
         }
-        isPlaying = true;
-        showThinking();
-        playTts(payload.text, () => {
-          isPlaying = false;
-          lastPlayedRole = "AI_MOVE";
-        });
+        audioQueue.push(entry);
+        playNextAudio();
       }
 
       async function startDemo() {
@@ -780,7 +805,8 @@ def demo():
       const sseStatusEl = document.getElementById("sse-status");
       const ttsStatusEl = document.getElementById("tts-status");
 
-      let pendingAiCommentary = null;
+      const audioQueue = [];
+      let pendingAiEntry = null;
       let isPlaying = false;
       let lastPlayedRole = null;
       const playedAudios = new Set();
@@ -812,19 +838,51 @@ def demo():
         return response.json();
       }
 
-      async function playTts(text, onEnded) {
-        const data = await requestTts(text);
-        if (!data || !data.audio_url) {
-          ttsStatusEl.textContent = "error";
+      function createAudioEntry(payload) {
+        const entry = {
+          role: payload.role,
+          text: payload.text,
+          audioUrl: null,
+          audioPromise: null,
+        };
+        entry.audioPromise = requestTts(payload.text)
+          .then((data) => {
+            if (!data || !data.audio_url) {
+              return null;
+            }
+            entry.audioUrl = data.audio_url;
+            return data.audio_url;
+          })
+          .catch(() => null);
+        return entry;
+      }
+
+      async function playNextAudio() {
+        if (isPlaying) {
           return;
         }
-        if (playedAudios.has(data.audio_url)) {
+        const entry = audioQueue.shift();
+        if (!entry) {
+          return;
+        }
+        isPlaying = true;
+        showThinking();
+        const audioUrl = await entry.audioPromise;
+        if (!audioUrl || playedAudios.has(audioUrl)) {
           clearThinking();
+          ttsStatusEl.textContent = audioUrl ? "idle" : "error";
+          ttsStatusEl.classList.remove("connected");
+          isPlaying = false;
+          if (entry.role === "PLAYER_MOVE" && pendingAiEntry) {
+            audioQueue.push(pendingAiEntry);
+            pendingAiEntry = null;
+          }
+          playNextAudio();
           return;
         }
-        playedAudios.add(data.audio_url);
+        playedAudios.add(audioUrl);
         const audio = document.createElement("audio");
-        audio.src = data.audio_url;
+        audio.src = audioUrl;
         audio.autoplay = true;
         audio.style.display = "none";
         audio.addEventListener("play", () => {
@@ -836,9 +894,13 @@ def demo():
           audio.remove();
           ttsStatusEl.textContent = "idle";
           ttsStatusEl.classList.remove("connected");
-          if (onEnded) {
-            onEnded();
+          isPlaying = false;
+          lastPlayedRole = entry.role;
+          if (entry.role === "PLAYER_MOVE" && pendingAiEntry) {
+            audioQueue.push(pendingAiEntry);
+            pendingAiEntry = null;
           }
+          playNextAudio();
         });
         document.body.appendChild(audio);
       }
@@ -848,34 +910,23 @@ def demo():
           return;
         }
         log(`${payload.role}: ${payload.text}`);
-        showThinking();
-        isPlaying = true;
-        playTts(payload.text, () => {
-          isPlaying = false;
-          lastPlayedRole = "PLAYER_MOVE";
-          if (pendingAiCommentary) {
-            const pending = pendingAiCommentary;
-            pendingAiCommentary = null;
-            handleAiCommentary(pending);
-          }
-        });
+        const entry = createAudioEntry(payload);
+        audioQueue.push(entry);
+        playNextAudio();
       }
 
       function handleAiCommentary(payload) {
         if (!payload || !payload.text) {
           return;
         }
+        log(`${payload.role}: ${payload.text}`);
+        const entry = createAudioEntry(payload);
         if (isPlaying || lastPlayedRole !== "PLAYER_MOVE") {
-          pendingAiCommentary = payload;
+          pendingAiEntry = entry;
           return;
         }
-        log(`${payload.role}: ${payload.text}`);
-        showThinking();
-        isPlaying = true;
-        playTts(payload.text, () => {
-          isPlaying = false;
-          lastPlayedRole = "AI_MOVE";
-        });
+        audioQueue.push(entry);
+        playNextAudio();
       }
 
       function handleCommentary(payload) {
