@@ -117,8 +117,19 @@ def demo_root():
   </head>
   <body>
     <button id="start-demo">Démarrer la démo</button>
+    <div id="tts-feedback" style="margin-top: 12px; color: #4b5563;"></div>
     <script>
       const button = document.getElementById("start-demo");
+      const ttsFeedbackEl = document.getElementById("tts-feedback");
+      const playedAudios = new Set();
+
+      function showThinking() {
+        ttsFeedbackEl.textContent = "🎧 Le coach réfléchit…";
+      }
+
+      function clearThinking() {
+        ttsFeedbackEl.textContent = "";
+      }
 
       async function requestTts(text) {
         const response = await fetch("/tts", {
@@ -137,10 +148,18 @@ def demo_root():
         if (!data || !data.audio_url) {
           return;
         }
+        if (playedAudios.has(data.audio_url)) {
+          clearThinking();
+          return;
+        }
+        playedAudios.add(data.audio_url);
         const audio = document.createElement("audio");
         audio.src = data.audio_url;
         audio.autoplay = true;
         audio.style.display = "none";
+        audio.addEventListener("play", () => {
+          clearThinking();
+        });
         audio.addEventListener("ended", () => {
           audio.remove();
         });
@@ -161,6 +180,7 @@ def demo_root():
           try {
             const payload = JSON.parse(event.data);
             if (payload && payload.text) {
+              showThinking();
               playTts(payload.text);
             }
           } catch (error) {
@@ -727,10 +747,21 @@ def demo():
       let expectedRole = "PLAYER_MOVE";
       let bufferedPlayer = null;
       let bufferedAi = null;
+      const playedAudios = new Set();
 
       function log(message) {
         const line = `[${new Date().toLocaleTimeString()}] ${message}\\n`;
         logEl.textContent = line + logEl.textContent;
+      }
+
+      function showThinking() {
+        ttsStatusEl.textContent = "🎧 Le coach réfléchit…";
+        ttsStatusEl.classList.add("connected");
+      }
+
+      function clearThinking() {
+        ttsStatusEl.textContent = "idle";
+        ttsStatusEl.classList.remove("connected");
       }
 
       function enqueueTts(text, role) {
@@ -756,14 +787,24 @@ def demo():
           ttsStatusEl.textContent = "error";
           return;
         }
-        ttsStatusEl.textContent = "ready";
-        ttsStatusEl.classList.add("connected");
+        if (playedAudios.has(data.audio_url)) {
+          clearThinking();
+          return;
+        }
+        playedAudios.add(data.audio_url);
         const audio = document.createElement("audio");
         audio.src = data.audio_url;
         audio.autoplay = true;
         audio.style.display = "none";
+        audio.addEventListener("play", () => {
+          clearThinking();
+          ttsStatusEl.textContent = "playing";
+          ttsStatusEl.classList.add("connected");
+        });
         audio.addEventListener("ended", () => {
           audio.remove();
+          ttsStatusEl.textContent = "idle";
+          ttsStatusEl.classList.remove("connected");
         });
         document.body.appendChild(audio);
       }
@@ -792,6 +833,7 @@ def demo():
         if (!payload || !payload.text || !payload.role) {
           return;
         }
+        showThinking();
         if (payload.role === expectedRole) {
           enqueueTts(payload.text, payload.role);
           expectedRole = expectedRole === "PLAYER_MOVE" ? "AI_MOVE" : "PLAYER_MOVE";
