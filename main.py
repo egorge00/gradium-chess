@@ -101,13 +101,20 @@ def demo_root():
         }
       }
 
-      function base64ToArrayBuffer(base64) {
+      function base64ToPcmSamples(base64) {
         const binary = atob(base64);
-        const bytes = new Uint8Array(binary.length);
+        const buffer = new ArrayBuffer(binary.length);
+        const bytes = new Uint8Array(buffer);
         for (let i = 0; i < binary.length; i += 1) {
           bytes[i] = binary.charCodeAt(i);
         }
-        return bytes.buffer;
+        const sampleCount = Math.floor(buffer.byteLength / 2);
+        const samples = new Float32Array(sampleCount);
+        const view = new DataView(buffer);
+        for (let i = 0; i < sampleCount; i += 1) {
+          samples[i] = view.getInt16(i * 2, true) / 32768;
+        }
+        return samples;
       }
 
       function showThinking() {
@@ -185,8 +192,10 @@ def demo_root():
       function enqueueAudioChunk(chunk) {
         ensureAudioContext();
         decodeChain = decodeChain
-          .then(() => audioContext.decodeAudioData(base64ToArrayBuffer(chunk)))
-          .then((buffer) => {
+          .then(() => {
+            const samples = base64ToPcmSamples(chunk);
+            const buffer = audioContext.createBuffer(1, samples.length, 24000);
+            buffer.copyToChannel(samples, 0);
             audioQueue.push(buffer);
             playNextAudio();
           })
@@ -315,7 +324,7 @@ class GradiumTTSManager:
                             "type": "setup",
                             "model_name": "default",
                             "voice_id": voice_id,
-                            "output_format": "wav",
+                            "output_format": "pcm_24000",
                         }
                     )
                 )
@@ -351,7 +360,7 @@ class GradiumTTSManager:
         utterance_id: str,
     ) -> None:
         sequence = 0
-        audio_buffer = bytearray()
+        total_bytes = 0
         while True:
             try:
                 message = await ws.recv()
@@ -379,7 +388,7 @@ class GradiumTTSManager:
                 if not raw:
                     continue
                 try:
-                    audio_buffer.extend(base64.b64decode(raw))
+                    decoded = base64.b64decode(raw)
                 except (binascii.Error, TypeError) as exc:
                     logger.warning(
                         "TTS audio chunk decode failed | sequence=%s error=%s",
@@ -387,6 +396,18 @@ class GradiumTTSManager:
                         exc,
                     )
                 else:
+                    total_bytes += len(decoded)
+                    publish_event(
+                        game_id,
+                        "tts-audio",
+                        {
+                            "role": role,
+                            "text": text,
+                            "utterance_id": utterance_id,
+                            "sequence": sequence,
+                            "chunk": raw,
+                        },
+                    )
                     logger.info("TTS audio chunk | sequence=%s", sequence)
                 sequence += 1
                 continue
@@ -395,19 +416,7 @@ class GradiumTTSManager:
                 break
             if message_type == "error":
                 raise RuntimeError(data.get("message") or "TTS error")
-        logger.info("TTS utterance bytes=%s", len(audio_buffer))
-        if audio_buffer:
-            publish_event(
-                game_id,
-                "tts-audio",
-                {
-                    "role": role,
-                    "text": text,
-                    "utterance_id": utterance_id,
-                    "sequence": sequence,
-                    "chunk": base64.b64encode(bytes(audio_buffer)).decode("ascii"),
-                },
-            )
+        logger.info("TTS utterance bytes=%s", total_bytes)
 
 
 def start_game_internal(
@@ -1100,13 +1109,20 @@ def demo():
         }
       }
 
-      function base64ToArrayBuffer(base64) {
+      function base64ToPcmSamples(base64) {
         const binary = atob(base64);
-        const bytes = new Uint8Array(binary.length);
+        const buffer = new ArrayBuffer(binary.length);
+        const bytes = new Uint8Array(buffer);
         for (let i = 0; i < binary.length; i += 1) {
           bytes[i] = binary.charCodeAt(i);
         }
-        return bytes.buffer;
+        const sampleCount = Math.floor(buffer.byteLength / 2);
+        const samples = new Float32Array(sampleCount);
+        const view = new DataView(buffer);
+        for (let i = 0; i < sampleCount; i += 1) {
+          samples[i] = view.getInt16(i * 2, true) / 32768;
+        }
+        return samples;
       }
 
       function log(message) {
@@ -1203,8 +1219,10 @@ def demo():
       function enqueueAudioChunk(chunk) {
         ensureAudioContext();
         decodeChain = decodeChain
-          .then(() => audioContext.decodeAudioData(base64ToArrayBuffer(chunk)))
-          .then((buffer) => {
+          .then(() => {
+            const samples = base64ToPcmSamples(chunk);
+            const buffer = audioContext.createBuffer(1, samples.length, 24000);
+            buffer.copyToChannel(samples, 0);
             audioQueue.push(buffer);
             playNextAudio();
           })
