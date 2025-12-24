@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 AUDIO_DIR = Path("audio")
+VOICE_COACH = os.getenv("VOICE_COACH_ID")
+VOICE_AI = os.getenv("VOICE_AI_ID")
 
 COMMENTARY_QUEUE: deque[tuple[str, str, str]] = deque()
 COMMENTARY_LOCK = threading.Lock()
@@ -92,11 +94,11 @@ def demo_root():
         ttsFeedbackEl.textContent = "";
       }
 
-      async function requestTts(text) {
+      async function requestTts(text, role) {
         const response = await fetch("/tts", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text }),
+          body: JSON.stringify({ text, role }),
         });
         if (!response.ok) {
           return null;
@@ -111,7 +113,7 @@ def demo_root():
           audioUrl: null,
           audioPromise: null,
         };
-        entry.audioPromise = requestTts(payload.text)
+        entry.audioPromise = requestTts(payload.text, payload.role)
           .then((data) => {
             if (!data || !data.audio_url) {
               return null;
@@ -496,10 +498,22 @@ async def tts(payload: dict):
     text = (payload or {}).get("text")
     if not text:
         raise HTTPException(status_code=400, detail="Missing text")
+    role = (payload or {}).get("role")
+    if role not in {"PLAYER_MOVE", "AI_MOVE"}:
+        raise HTTPException(status_code=400, detail="Missing or invalid role")
 
     gradium_key = os.getenv("GRADIUM_API_KEY")
     if not gradium_key:
         raise HTTPException(status_code=500, detail="GRADIUM_API_KEY not set")
+
+    voice_id = VOICE_COACH if role == "PLAYER_MOVE" else VOICE_AI
+    voice_label = "VOICE_COACH" if role == "PLAYER_MOVE" else "VOICE_AI"
+    if not voice_id:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{voice_label} not set",
+        )
+    logger.info("TTS | role=%s | voice=%s", role, voice_label)
 
     ensure_audio_dir()
     client = GradiumClient(api_key=gradium_key)
@@ -507,7 +521,7 @@ async def tts(payload: dict):
         result = await client.tts(
             setup={
                 "model_name": "default",
-                "voice_id": "YTpq7expH9539ERJ",
+                "voice_id": voice_id,
                 "output_format": "wav",
             },
             text=text,
