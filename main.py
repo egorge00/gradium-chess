@@ -301,7 +301,6 @@ class GradiumTTSManager:
             {"role": role, "text": text, "utterance_id": utterance_id},
         )
         logger.info("TTS connecting")
-        ended = False
         try:
             async with websockets.connect(
                 "wss://eu.api.gradium.ai/api/speech/tts",
@@ -320,20 +319,26 @@ class GradiumTTSManager:
                 )
                 await ws.send(json.dumps({"type": "text", "text": text, "flush": True}))
                 await self._stream_audio(ws, game_id, role, text, utterance_id)
+        except Exception as exc:
+            logger.warning(
+                "TTS speak failed | game_id=%s utterance_id=%s role=%s error=%s",
+                game_id,
+                utterance_id,
+                role,
+                exc,
+            )
         finally:
-            if not ended:
-                publish_event(
-                    game_id,
-                    "tts-end",
-                    {"role": role, "text": text, "utterance_id": utterance_id},
-                )
-                logger.info(
-                    "TTS end emitted | game_id=%s utterance_id=%s role=%s",
-                    game_id,
-                    utterance_id,
-                    role,
-                )
-                ended = True
+            publish_event(
+                game_id,
+                "tts-end",
+                {"role": role, "text": text, "utterance_id": utterance_id},
+            )
+            logger.info(
+                "TTS end emitted | game_id=%s utterance_id=%s role=%s",
+                game_id,
+                utterance_id,
+                role,
+            )
 
     async def _stream_audio(
         self,
