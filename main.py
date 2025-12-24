@@ -8,6 +8,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
+from pathlib import Path
 
 import requests
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+AUDIO_DIR = Path("audio")
 COMMENTARY_QUEUE: deque[tuple[str, str, str]] = deque()
 COMMENTARY_LOCK = threading.Lock()
 COMMENTARY_WORKER_ACTIVE = False
@@ -44,6 +46,7 @@ def health():
 
 @app.on_event("startup")
 async def start_tts_worker():
+    AUDIO_DIR.mkdir(exist_ok=True)
     await ensure_tts_worker()
 
 
@@ -81,8 +84,8 @@ async def tts_worker() -> None:
             continue
 
         audio_id = f"{uuid.uuid4().hex}.wav"
-        file_path = os.path.join("/tmp", f"tts_{audio_id}")
-        with open(file_path, "wb") as handle:
+        file_path = AUDIO_DIR / audio_id
+        with file_path.open("wb") as handle:
             handle.write(result.raw_data)
 
         if not future.done():
@@ -446,11 +449,11 @@ def audio(filename: str):
     if safe_name != filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    file_path = os.path.join("/tmp", f"tts_{safe_name}")
-    if not os.path.exists(file_path):
+    file_path = AUDIO_DIR / safe_name
+    if not file_path.exists():
         raise HTTPException(status_code=404, detail="Audio file not found")
 
-    return FileResponse(file_path, media_type="audio/wav")
+    return FileResponse(str(file_path), media_type="audio/wav")
 
 
 def enqueue_commentary(game_id: str, move_uci: str, role: str) -> None:
