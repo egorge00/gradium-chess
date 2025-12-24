@@ -234,13 +234,14 @@ class GradiumTTSManager:
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._worker_task: asyncio.Task | None = None
         self._active_voice_id: str | None = None
+        self._last_tts_sent_at = 0.0
 
     async def start(self) -> None:
         if self._worker_task:
             return
         self._ws = await websockets.connect(
             "wss://eu.api.gradium.ai/api/speech/tts",
-            additional_headers={"Authorization": f"Bearer {self.api_key}"},
+            additional_headers={"x-api-key": self.api_key},
             max_size=None,
         )
         await self._send_setup(self.voice_coach_id)
@@ -269,13 +270,37 @@ class GradiumTTSManager:
             raise RuntimeError("TTS websocket not connected")
         payload = {
             "type": "setup",
-            "api_key": self.api_key,
             "model_name": "default",
             "voice_id": voice_id,
             "output_format": "wav",
         }
         await self._ws.send(json.dumps(payload))
+        logger.info("TTS setup sent | game_id=%s | voice_id=%s", self.game_id, voice_id)
+        await self._await_ready()
         self._active_voice_id = voice_id
+
+    async def _await_ready(self) -> None:
+        if not self._ws:
+            raise RuntimeError("TTS websocket not connected")
+        while True:
+            message = await self._ws.recv()
+            if isinstance(message, bytes):
+                logger.info(
+                    "TTS ready (binary) | game_id=%s | bytes=%s",
+                    self.game_id,
+                    len(message),
+                )
+                return
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+            message_type = data.get("type")
+            if message_type == "ready":
+                logger.info("TTS ready | game_id=%s", self.game_id)
+                return
+            if message_type == "error":
+                raise RuntimeError(data.get("message") or "TTS error")
 
     async def _worker(self) -> None:
         while True:
@@ -284,6 +309,10 @@ class GradiumTTSManager:
                 break
             role, text, future = item
             try:
+                elapsed = time.monotonic() - self._last_tts_sent_at
+                if elapsed < 1.0:
+                    await asyncio.sleep(1.0 - elapsed)
+                self._last_tts_sent_at = time.monotonic()
                 await self._speak_once(role, text)
             except Exception as exc:
                 logger.warning("TTS speak failed: %s", exc)
