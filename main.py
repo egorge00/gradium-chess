@@ -82,16 +82,13 @@ def demo_root():
     <script>
       const button = document.getElementById("start-demo");
       const ttsFeedbackEl = document.getElementById("tts-feedback");
-      let pendingTtsCount = 0;
-      const ttsWatchdogs = new Map();
-      const ttsPendingIds = new Set();
-      let ttsWatchdogCounter = 0;
-      const TTS_WATCHDOG_MS = 15000;
       let audioContext = null;
-      let nextPlaybackTime = 0;
-      const ttsChunkQueue = [];
-      let isDrainingQueue = false;
       const PCM_SAMPLE_RATE = 24000;
+      const utteranceStates = new Map();
+      const utteranceQueue = [];
+      let currentUtteranceId = null;
+      let playbackChain = Promise.resolve();
+      let chunksInFlight = 0;
 
       function ensureAudioContext() {
         if (!audioContext) {
@@ -113,108 +110,110 @@ def demo_root():
         ttsFeedbackEl.textContent = "";
       }
 
-      function markTtsPending() {
-        pendingTtsCount += 1;
-        showThinking();
-      }
-
-      function markTtsComplete() {
-        pendingTtsCount = Math.max(0, pendingTtsCount - 1);
-        if (pendingTtsCount === 0) {
-          clearThinking();
-        }
-      }
-
-      function startTtsWatchdog(utteranceId) {
-        const key = utteranceId || `local-${++ttsWatchdogCounter}`;
-        const existing = ttsWatchdogs.get(key);
-        if (existing) {
-          clearTimeout(existing);
-        }
-        ttsPendingIds.add(key);
-        const timer = setTimeout(() => {
-          console.warn("tts watchdog fired", key);
-          ttsWatchdogs.delete(key);
-          if (ttsPendingIds.delete(key)) {
-            markTtsComplete();
-          }
-        }, TTS_WATCHDOG_MS);
-        ttsWatchdogs.set(key, timer);
-        return key;
-      }
-
-      function clearTtsWatchdog(utteranceId) {
-        if (!utteranceId) {
-          return;
-        }
-        const timer = ttsWatchdogs.get(utteranceId);
-        if (timer) {
-          clearTimeout(timer);
-          ttsWatchdogs.delete(utteranceId);
-        }
-        if (ttsPendingIds.delete(utteranceId)) {
-          markTtsComplete();
-        }
-      }
-
       function decodeBase64ToFloat32(base64Chunk) {
         const binary = atob(base64Chunk);
-        const buffer = new ArrayBuffer(binary.length);
-        const bytes = new Uint8Array(buffer);
+        const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i += 1) {
           bytes[i] = binary.charCodeAt(i);
         }
-        const int16View = new DataView(buffer);
-        const sampleCount = Math.floor(buffer.byteLength / 2);
+        const sampleCount = Math.floor(bytes.byteLength / 2);
         const samples = new Float32Array(sampleCount);
+        const int16View = new DataView(bytes.buffer);
         for (let i = 0; i < sampleCount; i += 1) {
           samples[i] = int16View.getInt16(i * 2, true) / 32768;
         }
         return samples;
       }
 
-      function scheduleAudioBuffer(buffer) {
-        ensureAudioContext();
-        const startAt = Math.max(audioContext.currentTime, nextPlaybackTime);
-        const source = audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioContext.destination);
-        source.start(startAt);
-        nextPlaybackTime = startAt + buffer.duration;
+      function playAudioBuffer(buffer) {
+        return new Promise((resolve) => {
+          ensureAudioContext();
+          const source = audioContext.createBufferSource();
+          source.buffer = buffer;
+          source.connect(audioContext.destination);
+          source.addEventListener("ended", resolve);
+          source.start();
+        });
       }
 
-      function drainTtsQueue() {
-        if (isDrainingQueue) {
+      function playChunk(base64Chunk) {
+        ensureAudioContext();
+        const samples = decodeBase64ToFloat32(base64Chunk);
+        const buffer = audioContext.createBuffer(
+          1,
+          samples.length,
+          PCM_SAMPLE_RATE
+        );
+        buffer.copyToChannel(samples, 0);
+        return playAudioBuffer(buffer);
+      }
+
+      function getOrCreateUtterance(utteranceId) {
+        if (!utteranceStates.has(utteranceId)) {
+          utteranceStates.set(utteranceId, {
+            expectedSequence: 0,
+            pendingChunks: new Map(),
+            ended: false,
+          });
+        }
+        return utteranceStates.get(utteranceId);
+      }
+
+      function setCurrentUtterance(utteranceId) {
+        currentUtteranceId = utteranceId;
+        showThinking();
+        drainCurrentChunks();
+      }
+
+      function maybeAdvanceUtterance() {
+        if (!currentUtteranceId) {
           return;
         }
-        isDrainingQueue = true;
-        ensureAudioContext();
-        if (nextPlaybackTime < audioContext.currentTime) {
-          nextPlaybackTime = audioContext.currentTime;
+        const state = utteranceStates.get(currentUtteranceId);
+        if (!state) {
+          return;
         }
-        while (ttsChunkQueue.length > 0) {
-          const chunk = ttsChunkQueue.shift();
-          const samples = decodeBase64ToFloat32(chunk);
-          const buffer = audioContext.createBuffer(
-            1,
-            samples.length,
-            PCM_SAMPLE_RATE
-          );
-          buffer.copyToChannel(samples, 0);
-          // FIFO scheduling avoids destructive overlaps without relying on "ended".
-          scheduleAudioBuffer(buffer);
+        if (!state.ended || state.pendingChunks.size > 0 || chunksInFlight > 0) {
+          return;
         }
-        isDrainingQueue = false;
+        utteranceStates.delete(currentUtteranceId);
+        currentUtteranceId = null;
+        if (utteranceQueue.length > 0) {
+          const nextId = utteranceQueue.shift();
+          setCurrentUtterance(nextId);
+        } else {
+          clearThinking();
+        }
       }
 
-      function handleTtsChunk(base64Chunk) {
-        ttsChunkQueue.push(base64Chunk);
-        drainTtsQueue();
-      }
-
-      function enqueueAudioChunk(chunk) {
-        ensureAudioContext();
-        handleTtsChunk(chunk);
+      function drainCurrentChunks() {
+        if (!currentUtteranceId) {
+          return;
+        }
+        const state = utteranceStates.get(currentUtteranceId);
+        if (!state) {
+          return;
+        }
+        while (state.pendingChunks.has(state.expectedSequence)) {
+          const sequence = state.expectedSequence;
+          const chunk = state.pendingChunks.get(sequence);
+          state.pendingChunks.delete(sequence);
+          state.expectedSequence += 1;
+          console.log(`play chunk u=${currentUtteranceId} seq=${sequence}`);
+          chunksInFlight += 1;
+          playbackChain = playbackChain
+            .then(() => playChunk(chunk))
+            .finally(() => {
+              chunksInFlight = Math.max(0, chunksInFlight - 1);
+              maybeAdvanceUtterance();
+            });
+        }
+        if (
+          state.pendingChunks.size > 0 &&
+          !state.pendingChunks.has(state.expectedSequence)
+        ) {
+          console.log(`gap waiting for seq=${state.expectedSequence}`);
+        }
       }
 
       async function startDemo() {
@@ -238,35 +237,60 @@ def demo_root():
           }
         });
         eventSource.addEventListener("tts-start", (event) => {
-          let utteranceId;
+          let utteranceId = null;
           try {
             const payload = JSON.parse(event.data);
             utteranceId = payload && payload.utterance_id;
           } catch (error) {
-            utteranceId = undefined;
+            utteranceId = null;
           }
-          markTtsPending();
-          startTtsWatchdog(utteranceId);
+          if (!utteranceId) {
+            return;
+          }
+          getOrCreateUtterance(utteranceId);
+          if (!currentUtteranceId) {
+            setCurrentUtterance(utteranceId);
+          } else {
+            utteranceQueue.push(utteranceId);
+          }
         });
         eventSource.addEventListener("tts-audio", (event) => {
           try {
             const payload = JSON.parse(event.data);
-            if (payload && payload.chunk) {
-              enqueueAudioChunk(payload.chunk);
+            if (payload && payload.chunk && payload.utterance_id != null) {
+              const utteranceId = payload.utterance_id;
+              const sequence = Number(payload.sequence);
+              console.log(`received chunk u=${utteranceId} seq=${sequence}`);
+              const state = getOrCreateUtterance(utteranceId);
+              state.pendingChunks.set(sequence, payload.chunk);
+              if (!currentUtteranceId) {
+                setCurrentUtterance(utteranceId);
+              }
+              if (utteranceId === currentUtteranceId) {
+                drainCurrentChunks();
+              }
             }
           } catch (error) {
             return;
           }
         });
         eventSource.addEventListener("tts-end", (event) => {
-          let utteranceId;
+          let utteranceId = null;
           try {
             const payload = JSON.parse(event.data);
             utteranceId = payload && payload.utterance_id;
           } catch (error) {
-            utteranceId = undefined;
+            utteranceId = null;
           }
-          clearTtsWatchdog(utteranceId);
+          if (!utteranceId) {
+            return;
+          }
+          console.log(`tts-end u=${utteranceId}`);
+          const state = getOrCreateUtterance(utteranceId);
+          state.ended = true;
+          if (utteranceId === currentUtteranceId) {
+            maybeAdvanceUtterance();
+          }
         });
       }
 
@@ -300,7 +324,9 @@ def env_check():
 class GradiumTTSManager:
     def __init__(self, api_key: str) -> None:
         self.api_key = api_key
-        self._lock = asyncio.Lock()
+        self._queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._ws: websockets.WebSocketClientProtocol | None = None
         self._last_tts_sent_at = 0.0
 
     async def speak(self, game_id: str, role: str, text: str) -> None:
@@ -309,9 +335,40 @@ class GradiumTTSManager:
         voice_id = get_voice_id_for_game(game_id, role)
         if not voice_id:
             raise RuntimeError("Missing voice id for TTS")
-        async with self._lock:
-            await self._throttle()
-            await self._speak_once(game_id, role, text, voice_id)
+        loop = asyncio.get_running_loop()
+        completion: asyncio.Future = loop.create_future()
+        await self._queue.put(
+            {
+                "game_id": game_id,
+                "role": role,
+                "text": text,
+                "voice_id": voice_id,
+                "completion": completion,
+            }
+        )
+        if not self._worker_task or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._run_worker())
+        await completion
+
+    async def _run_worker(self) -> None:
+        while True:
+            job = await self._queue.get()
+            completion: asyncio.Future = job["completion"]
+            try:
+                await self._throttle()
+                await self._speak_once(
+                    job["game_id"],
+                    job["role"],
+                    job["text"],
+                    job["voice_id"],
+                )
+                if not completion.done():
+                    completion.set_result(None)
+            except Exception as exc:
+                logger.warning("TTS worker error: %s", exc)
+                await self._reset_connection()
+                if not completion.done():
+                    completion.set_exception(exc)
 
     async def _throttle(self) -> None:
         elapsed = time.monotonic() - self._last_tts_sent_at
@@ -324,27 +381,30 @@ class GradiumTTSManager:
         publish_event(
             game_id,
             "tts-start",
-            {"role": role, "text": text, "utterance_id": utterance_id},
+            {
+                "role": role,
+                "text": text,
+                "utterance_id": utterance_id,
+                "sample_rate": 24000,
+                "channels": 1,
+                "sample_format": "s16le",
+            },
         )
         logger.info("TTS connecting")
         try:
-            async with websockets.connect(
-                "wss://eu.api.gradium.ai/api/speech/tts",
-                additional_headers={"x-api-key": self.api_key},
-                max_size=None,
-            ) as ws:
-                await ws.send(
-                    json.dumps(
-                        {
-                            "type": "setup",
-                            "model_name": "default",
-                            "voice_id": voice_id,
-                            "output_format": "pcm_24000",
-                        }
-                    )
+            ws = await self._ensure_connection()
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "setup",
+                        "model_name": "default",
+                        "voice_id": voice_id,
+                        "output_format": "pcm_24000",
+                    }
                 )
-                await ws.send(json.dumps({"type": "text", "text": text, "flush": True}))
-                await self._stream_audio(ws, game_id, role, text, utterance_id)
+            )
+            await ws.send(json.dumps({"type": "text", "text": text, "flush": True}))
+            await self._stream_audio(ws, game_id, role, text, utterance_id)
         except Exception as exc:
             logger.warning(
                 "TTS speak failed | game_id=%s utterance_id=%s role=%s error=%s",
@@ -353,6 +413,7 @@ class GradiumTTSManager:
                 role,
                 exc,
             )
+            await self._reset_connection()
         finally:
             publish_event(
                 game_id,
@@ -365,6 +426,27 @@ class GradiumTTSManager:
                 utterance_id,
                 role,
             )
+
+    async def _ensure_connection(self) -> websockets.WebSocketClientProtocol:
+        if self._ws and not self._ws.closed:
+            return self._ws
+        if self._ws:
+            await self._ws.close()
+        self._ws = await websockets.connect(
+            "wss://eu.api.gradium.ai/api/speech/tts",
+            additional_headers={"x-api-key": self.api_key},
+            max_size=None,
+        )
+        return self._ws
+
+    async def _reset_connection(self) -> None:
+        if not self._ws:
+            return
+        try:
+            await self._ws.close()
+        except Exception:
+            pass
+        self._ws = None
 
     async def _stream_audio(
         self,
@@ -1105,15 +1187,13 @@ def demo():
       const sseStatusEl = document.getElementById("sse-status");
       const ttsStatusEl = document.getElementById("tts-status");
 
-      const audioQueue = [];
-      let isPlaying = false;
-      let pendingTtsCount = 0;
-      const ttsWatchdogs = new Map();
-      const ttsPendingIds = new Set();
-      let ttsWatchdogCounter = 0;
-      const TTS_WATCHDOG_MS = 15000;
       let audioContext = null;
-      let decodeChain = Promise.resolve();
+      const PCM_SAMPLE_RATE = 24000;
+      const utteranceStates = new Map();
+      const utteranceQueue = [];
+      let currentUtteranceId = null;
+      let playbackChain = Promise.resolve();
+      let chunksInFlight = 0;
 
       function ensureAudioContext() {
         if (!audioContext) {
@@ -1126,14 +1206,13 @@ def demo():
 
       function base64ToPcmSamples(base64) {
         const binary = atob(base64);
-        const buffer = new ArrayBuffer(binary.length);
-        const bytes = new Uint8Array(buffer);
+        const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i += 1) {
           bytes[i] = binary.charCodeAt(i);
         }
-        const sampleCount = Math.floor(buffer.byteLength / 2);
+        const sampleCount = Math.floor(bytes.byteLength / 2);
         const samples = new Float32Array(sampleCount);
-        const view = new DataView(buffer);
+        const view = new DataView(bytes.buffer);
         for (let i = 0; i < sampleCount; i += 1) {
           samples[i] = view.getInt16(i * 2, true) / 32768;
         }
@@ -1155,73 +1234,27 @@ def demo():
         ttsStatusEl.classList.remove("connected");
       }
 
-      function markTtsPending() {
-        pendingTtsCount += 1;
-        showThinking();
-      }
-
-      function markTtsComplete() {
-        pendingTtsCount = Math.max(0, pendingTtsCount - 1);
-        if (pendingTtsCount === 0) {
-          clearThinking();
-        }
-      }
-
-      function startTtsWatchdog(utteranceId) {
-        const key = utteranceId || `local-${++ttsWatchdogCounter}`;
-        const existing = ttsWatchdogs.get(key);
-        if (existing) {
-          clearTimeout(existing);
-        }
-        ttsPendingIds.add(key);
-        const timer = setTimeout(() => {
-          console.warn("tts watchdog fired", key);
-          ttsWatchdogs.delete(key);
-          if (ttsPendingIds.delete(key)) {
-            markTtsComplete();
-          }
-        }, TTS_WATCHDOG_MS);
-        ttsWatchdogs.set(key, timer);
-        return key;
-      }
-
-      function clearTtsWatchdog(utteranceId) {
-        if (!utteranceId) {
-          return;
-        }
-        const timer = ttsWatchdogs.get(utteranceId);
-        if (timer) {
-          clearTimeout(timer);
-          ttsWatchdogs.delete(utteranceId);
-        }
-        if (ttsPendingIds.delete(utteranceId)) {
-          markTtsComplete();
-        }
-      }
-
-      async function playNextAudio() {
-        if (isPlaying) {
-          return;
-        }
-        const buffer = audioQueue.shift();
-        if (!buffer) {
-          return;
-        }
-        ensureAudioContext();
-        const source = audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioContext.destination);
-        isPlaying = true;
-        source.addEventListener("ended", () => {
-          ttsStatusEl.textContent = "idle";
-          ttsStatusEl.classList.remove("connected");
-          isPlaying = false;
-          playNextAudio();
+      function playAudioBuffer(buffer) {
+        return new Promise((resolve) => {
+          ensureAudioContext();
+          const source = audioContext.createBufferSource();
+          source.buffer = buffer;
+          source.connect(audioContext.destination);
+          source.addEventListener("ended", resolve);
+          source.start();
         });
-        clearThinking();
-        ttsStatusEl.textContent = "playing";
-        ttsStatusEl.classList.add("connected");
-        source.start();
+      }
+
+      function playChunk(base64Chunk) {
+        ensureAudioContext();
+        const samples = base64ToPcmSamples(base64Chunk);
+        const buffer = audioContext.createBuffer(
+          1,
+          samples.length,
+          PCM_SAMPLE_RATE
+        );
+        buffer.copyToChannel(samples, 0);
+        return playAudioBuffer(buffer);
       }
 
       function handleCommentary(payload) {
@@ -1231,20 +1264,72 @@ def demo():
         log(`${payload.role}: ${payload.text}`);
       }
 
-      function enqueueAudioChunk(chunk) {
-        ensureAudioContext();
-        decodeChain = decodeChain
-          .then(() => {
-            const samples = base64ToPcmSamples(chunk);
-            const buffer = audioContext.createBuffer(1, samples.length, 24000);
-            buffer.copyToChannel(samples, 0);
-            audioQueue.push(buffer);
-            playNextAudio();
-          })
-          .catch(() => {
-            ttsStatusEl.textContent = "error";
-            ttsStatusEl.classList.remove("connected");
+      function getOrCreateUtterance(utteranceId) {
+        if (!utteranceStates.has(utteranceId)) {
+          utteranceStates.set(utteranceId, {
+            expectedSequence: 0,
+            pendingChunks: new Map(),
+            ended: false,
           });
+        }
+        return utteranceStates.get(utteranceId);
+      }
+
+      function setCurrentUtterance(utteranceId) {
+        currentUtteranceId = utteranceId;
+        showThinking();
+        drainCurrentChunks();
+      }
+
+      function maybeAdvanceUtterance() {
+        if (!currentUtteranceId) {
+          return;
+        }
+        const state = utteranceStates.get(currentUtteranceId);
+        if (!state) {
+          return;
+        }
+        if (!state.ended || state.pendingChunks.size > 0 || chunksInFlight > 0) {
+          return;
+        }
+        utteranceStates.delete(currentUtteranceId);
+        currentUtteranceId = null;
+        if (utteranceQueue.length > 0) {
+          const nextId = utteranceQueue.shift();
+          setCurrentUtterance(nextId);
+        } else {
+          clearThinking();
+        }
+      }
+
+      function drainCurrentChunks() {
+        if (!currentUtteranceId) {
+          return;
+        }
+        const state = utteranceStates.get(currentUtteranceId);
+        if (!state) {
+          return;
+        }
+        while (state.pendingChunks.has(state.expectedSequence)) {
+          const sequence = state.expectedSequence;
+          const chunk = state.pendingChunks.get(sequence);
+          state.pendingChunks.delete(sequence);
+          state.expectedSequence += 1;
+          console.log(`play chunk u=${currentUtteranceId} seq=${sequence}`);
+          chunksInFlight += 1;
+          playbackChain = playbackChain
+            .then(() => playChunk(chunk))
+            .finally(() => {
+              chunksInFlight = Math.max(0, chunksInFlight - 1);
+              maybeAdvanceUtterance();
+            });
+        }
+        if (
+          state.pendingChunks.size > 0 &&
+          !state.pendingChunks.has(state.expectedSequence)
+        ) {
+          console.log(`gap waiting for seq=${state.expectedSequence}`);
+        }
       }
 
       async function startDemo() {
@@ -1264,35 +1349,60 @@ def demo():
           }
         });
         eventSource.addEventListener("tts-start", (event) => {
-          let utteranceId;
+          let utteranceId = null;
           try {
             const payload = JSON.parse(event.data);
             utteranceId = payload && payload.utterance_id;
           } catch (error) {
-            utteranceId = undefined;
+            utteranceId = null;
           }
-          markTtsPending();
-          startTtsWatchdog(utteranceId);
+          if (!utteranceId) {
+            return;
+          }
+          getOrCreateUtterance(utteranceId);
+          if (!currentUtteranceId) {
+            setCurrentUtterance(utteranceId);
+          } else {
+            utteranceQueue.push(utteranceId);
+          }
         });
         eventSource.addEventListener("tts-audio", (event) => {
           try {
             const payload = JSON.parse(event.data);
-            if (payload && payload.chunk) {
-              enqueueAudioChunk(payload.chunk);
+            if (payload && payload.chunk && payload.utterance_id != null) {
+              const utteranceId = payload.utterance_id;
+              const sequence = Number(payload.sequence);
+              console.log(`received chunk u=${utteranceId} seq=${sequence}`);
+              const state = getOrCreateUtterance(utteranceId);
+              state.pendingChunks.set(sequence, payload.chunk);
+              if (!currentUtteranceId) {
+                setCurrentUtterance(utteranceId);
+              }
+              if (utteranceId === currentUtteranceId) {
+                drainCurrentChunks();
+              }
             }
           } catch (error) {
             return;
           }
         });
         eventSource.addEventListener("tts-end", (event) => {
-          let utteranceId;
+          let utteranceId = null;
           try {
             const payload = JSON.parse(event.data);
             utteranceId = payload && payload.utterance_id;
           } catch (error) {
-            utteranceId = undefined;
+            utteranceId = null;
           }
-          clearTtsWatchdog(utteranceId);
+          if (!utteranceId) {
+            return;
+          }
+          console.log(`tts-end u=${utteranceId}`);
+          const state = getOrCreateUtterance(utteranceId);
+          state.ended = true;
+          if (utteranceId === currentUtteranceId) {
+            maybeAdvanceUtterance();
+          }
         });
         eventSource.addEventListener("open", () => {
           sseStatusEl.textContent = "connected";
