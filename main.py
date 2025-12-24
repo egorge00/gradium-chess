@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import json
@@ -37,7 +39,7 @@ CURRENT_TURN = {
     "player_commented": False,
     "ai_commented": False,
 }
-TTS_MANAGER: "GradiumTTSManager" | None = None
+TTS_MANAGER: GradiumTTSManager | None = None
 TTS_MANAGER_LOCK = threading.Lock()
 GAME_CONTEXTS: dict[str, dict] = {}
 GAME_CONTEXTS_LOCK = threading.Lock()
