@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -8,12 +9,11 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
-from pathlib import Path
 
 import requests
+import websockets
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
-from gradium.client import GradiumClient
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google import genai
 
 logging.basicConfig(level=logging.INFO)
@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-AUDIO_DIR = Path("audio")
 VOICE_COACH = os.getenv("VOICE_COACH_ID")
 VOICE_AI = os.getenv("VOICE_AI_ID")
 
@@ -30,16 +29,17 @@ COMMENTARY_LOCK = threading.Lock()
 COMMENTARY_WORKER_ACTIVE = False
 LAST_LLM_CALL_AT: float | None = None
 LAST_PROCESSED_MOVE_COUNT = 0
-COMMENTARY_SUBSCRIBERS: dict[str, dict] = {}
-COMMENTARY_SUBSCRIBERS_LOCK = threading.Lock()
+EVENT_SUBSCRIBERS: dict[str, dict] = {}
+EVENT_SUBSCRIBERS_LOCK = threading.Lock()
 CURRENT_TURN = {
     "player_move": None,
     "ai_move": None,
     "player_commented": False,
     "ai_commented": False,
 }
-TTS_LOCK = asyncio.Lock()
-LAST_TTS_CALL_AT: float | None = None
+GAME_TTS_MANAGERS: dict[str, "GradiumTTSManager"] = {}
+GAME_TTS_LOCK = threading.Lock()
+APP_LOOP: asyncio.AbstractEventLoop | None = None
 
 @app.get("/health")
 def health():
@@ -48,11 +48,8 @@ def health():
 
 @app.on_event("startup")
 async def start_tts_worker():
-    ensure_audio_dir()
-
-
-def ensure_audio_dir() -> None:
-    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    global APP_LOOP
+    APP_LOOP = asyncio.get_running_loop()
 
 
 @app.get("/")
@@ -79,15 +76,29 @@ def demo_root():
     <script>
       const button = document.getElementById("start-demo");
       const ttsFeedbackEl = document.getElementById("tts-feedback");
-      const playedAudios = new Set();
       const audioQueue = [];
-      let pendingAiEntry = null;
       let isPlaying = false;
-      let lastPlayedRole = null;
-      let currentEntry = null;
       let pendingTtsCount = 0;
-      const audioPlayer = new Audio();
-      audioPlayer.preload = "auto";
+      let audioContext = null;
+      let decodeChain = Promise.resolve();
+
+      function ensureAudioContext() {
+        if (!audioContext) {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioContext.state === "suspended") {
+          audioContext.resume().catch(() => {});
+        }
+      }
+
+      function base64ToArrayBuffer(base64) {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes.buffer;
+      }
 
       function showThinking() {
         ttsFeedbackEl.textContent = "🎧 Le coach réfléchit…";
@@ -109,120 +120,35 @@ def demo_root():
         }
       }
 
-      async function requestTts(text, role) {
-        const response = await fetch("/tts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, role }),
-        });
-        if (!response.ok) {
-          return null;
-        }
-        return response.json();
-      }
-
-      function createAudioEntry(payload) {
-        const entry = {
-          role: payload.role,
-          text: payload.text,
-          audioUrl: null,
-          audioPromise: null,
-        };
-        markTtsPending();
-        entry.audioPromise = requestTts(payload.text, payload.role)
-          .then((data) => {
-            if (!data || !data.audio_url) {
-              return null;
-            }
-            entry.audioUrl = data.audio_url;
-            return data.audio_url;
-          })
-          .catch(() => null)
-          .finally(() => markTtsComplete());
-        return entry;
-      }
-
       async function playNextAudio() {
         if (isPlaying) {
           return;
         }
-        const entry = audioQueue.shift();
-        if (!entry) {
+        const buffer = audioQueue.shift();
+        if (!buffer) {
           return;
         }
+        ensureAudioContext();
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioContext.destination);
         isPlaying = true;
-        const audioUrl = await entry.audioPromise;
-        if (!audioUrl || playedAudios.has(audioUrl)) {
+        source.addEventListener("ended", () => {
           isPlaying = false;
-          if (entry.role === "PLAYER_MOVE" && pendingAiEntry) {
-            audioQueue.push(pendingAiEntry);
-            pendingAiEntry = null;
-          }
           playNextAudio();
-          return;
-        }
-        playedAudios.add(audioUrl);
-        currentEntry = entry;
-        const handleCanPlay = () => {
-          audioPlayer.removeEventListener("canplay", handleCanPlay);
-          audioPlayer.play().catch(() => {
-            isPlaying = false;
-            currentEntry = null;
-            if (entry.role === "PLAYER_MOVE" && pendingAiEntry) {
-              audioQueue.push(pendingAiEntry);
-              pendingAiEntry = null;
-            }
+        });
+        source.start();
+      }
+
+      function enqueueAudioChunk(chunk) {
+        ensureAudioContext();
+        decodeChain = decodeChain
+          .then(() => audioContext.decodeAudioData(base64ToArrayBuffer(chunk)))
+          .then((buffer) => {
+            audioQueue.push(buffer);
             playNextAudio();
-          });
-        };
-        audioPlayer.addEventListener("canplay", handleCanPlay);
-        audioPlayer.src = audioUrl;
-        audioPlayer.load();
-      }
-
-      audioPlayer.addEventListener("ended", () => {
-        if (!currentEntry) {
-          return;
-        }
-        const finishedEntry = currentEntry;
-        currentEntry = null;
-        isPlaying = false;
-        lastPlayedRole = finishedEntry.role;
-        if (finishedEntry.role === "PLAYER_MOVE" && pendingAiEntry) {
-          audioQueue.push(pendingAiEntry);
-          pendingAiEntry = null;
-        }
-        playNextAudio();
-      });
-
-      audioPlayer.addEventListener("error", () => {
-        if (!currentEntry) {
-          return;
-        }
-        const failedEntry = currentEntry;
-        currentEntry = null;
-        isPlaying = false;
-        if (failedEntry.role === "PLAYER_MOVE" && pendingAiEntry) {
-          audioQueue.push(pendingAiEntry);
-          pendingAiEntry = null;
-        }
-        playNextAudio();
-      });
-
-      function handlePlayerCommentary(payload) {
-        const entry = createAudioEntry(payload);
-        audioQueue.push(entry);
-        playNextAudio();
-      }
-
-      function handleAiCommentary(payload) {
-        const entry = createAudioEntry(payload);
-        if (isPlaying || lastPlayedRole !== "PLAYER_MOVE") {
-          pendingAiEntry = entry;
-          return;
-        }
-        audioQueue.push(entry);
-        playNextAudio();
+          })
+          .catch(() => {});
       }
 
       async function startDemo() {
@@ -239,19 +165,32 @@ def demo_root():
           try {
             const payload = JSON.parse(event.data);
             if (payload && payload.text && payload.role) {
-              if (payload.role === "PLAYER_MOVE") {
-                handlePlayerCommentary(payload);
-              } else if (payload.role === "AI_MOVE") {
-                handleAiCommentary(payload);
-              }
+              return;
             }
           } catch (error) {
             return;
           }
         });
+        eventSource.addEventListener("tts-start", () => {
+          markTtsPending();
+        });
+        eventSource.addEventListener("tts-audio", (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload && payload.chunk) {
+              enqueueAudioChunk(payload.chunk);
+            }
+          } catch (error) {
+            return;
+          }
+        });
+        eventSource.addEventListener("tts-end", () => {
+          markTtsComplete();
+        });
       }
 
       button.addEventListener("click", async () => {
+        ensureAudioContext();
         startDemo();
       });
     </script>
@@ -275,6 +214,148 @@ def env_check():
         "has_openai_key": bool(os.getenv("OPENAI_API_KEY")),
         "ai_level": ai_level,
     }
+
+
+class GradiumTTSManager:
+    def __init__(
+        self,
+        game_id: str,
+        api_key: str,
+        voice_human_id: str,
+        voice_ai_id: str,
+    ) -> None:
+        self.game_id = game_id
+        self.api_key = api_key
+        self.voice_human_id = voice_human_id
+        self.voice_ai_id = voice_ai_id
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._worker_task: asyncio.Task | None = None
+        self._active_voice_id: str | None = None
+
+    async def start(self) -> None:
+        if self._worker_task:
+            return
+        self._ws = await websockets.connect(
+            "wss://eu.api.gradium.ai/api/speech/tts",
+            extra_headers={"Authorization": f"Bearer {self.api_key}"},
+            max_size=None,
+        )
+        await self._send_setup(self.voice_human_id)
+        self._worker_task = asyncio.create_task(self._worker())
+
+    async def close(self) -> None:
+        if self._worker_task:
+            await self._queue.put(None)
+            await self._worker_task
+        if self._ws:
+            await self._ws.close()
+            self._ws = None
+
+    async def speak(self, role: str, text: str) -> None:
+        if role not in {"PLAYER_MOVE", "AI_MOVE"}:
+            raise ValueError(f"Invalid role: {role}")
+        if not self._worker_task:
+            await self.start()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        await self._queue.put((role, text, future))
+        await future
+
+    async def _send_setup(self, voice_id: str) -> None:
+        if not self._ws:
+            raise RuntimeError("TTS websocket not connected")
+        payload = {
+            "type": "setup",
+            "model_name": "default",
+            "voice_id": voice_id,
+            "output_format": "wav",
+        }
+        await self._ws.send(json.dumps(payload))
+        self._active_voice_id = voice_id
+
+    async def _worker(self) -> None:
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                break
+            role, text, future = item
+            try:
+                await self._speak_once(role, text)
+            except Exception as exc:
+                logger.warning("TTS speak failed: %s", exc)
+                if not future.done():
+                    future.set_exception(exc)
+            else:
+                if not future.done():
+                    future.set_result(True)
+
+    async def _speak_once(self, role: str, text: str) -> None:
+        if not self._ws:
+            raise RuntimeError("TTS websocket not connected")
+        voice_id = self.voice_human_id if role == "PLAYER_MOVE" else self.voice_ai_id
+        if voice_id != self._active_voice_id:
+            await self._send_setup(voice_id)
+        utterance_id = uuid.uuid4().hex
+        publish_event(
+            self.game_id,
+            "tts-start",
+            {"role": role, "text": text, "utterance_id": utterance_id},
+        )
+        await self._ws.send(
+            json.dumps({"type": "text", "text": text, "flush": True})
+        )
+        await self._stream_audio(role, text, utterance_id)
+
+    async def _stream_audio(self, role: str, text: str, utterance_id: str) -> None:
+        if not self._ws:
+            raise RuntimeError("TTS websocket not connected")
+        sequence = 0
+        while True:
+            message = await self._ws.recv()
+            chunk: bytes | None = None
+            is_final = False
+            if isinstance(message, bytes):
+                chunk = message
+            else:
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+                message_type = data.get("type")
+                if message_type in {"audio", "audio_chunk", "chunk"}:
+                    raw = data.get("data") or data.get("audio")
+                    if raw:
+                        chunk = base64.b64decode(raw)
+                    is_final = bool(
+                        data.get("final") or data.get("is_final") or data.get("done")
+                    )
+                elif message_type in {"done", "end", "final"}:
+                    is_final = True
+                elif message_type == "error":
+                    raise RuntimeError(data.get("message") or "TTS error")
+
+            if chunk:
+                publish_event(
+                    self.game_id,
+                    "tts-audio",
+                    {
+                        "role": role,
+                        "text": text,
+                        "utterance_id": utterance_id,
+                        "sequence": sequence,
+                        "chunk": base64.b64encode(chunk).decode("ascii"),
+                    },
+                )
+                sequence += 1
+            if is_final:
+                break
+
+        publish_event(
+            self.game_id,
+            "tts-end",
+            {"role": role, "text": text, "utterance_id": utterance_id},
+        )
 
 
 def start_game_internal(background_tasks: BackgroundTasks) -> dict:
@@ -322,8 +403,44 @@ def start_game_internal(background_tasks: BackgroundTasks) -> dict:
     game_url = f"https://lichess.org/{game_id}"
 
     background_tasks.add_task(stream_game_state, game_id)
+    ensure_tts_manager(game_id)
 
     return {"game_id": game_id, "game_url": game_url}
+
+
+def ensure_tts_manager(game_id: str) -> GradiumTTSManager | None:
+    gradium_key = os.getenv("GRADIUM_API_KEY")
+    if not gradium_key:
+        logger.warning("GRADIUM_API_KEY not set; skipping TTS manager")
+        return None
+    if not VOICE_COACH or not VOICE_AI:
+        logger.warning("VOICE_COACH_ID or VOICE_AI_ID not set; skipping TTS manager")
+        return None
+
+    with GAME_TTS_LOCK:
+        manager = GAME_TTS_MANAGERS.get(game_id)
+        if manager:
+            return manager
+        manager = GradiumTTSManager(
+            game_id=game_id,
+            api_key=gradium_key,
+            voice_human_id=VOICE_COACH,
+            voice_ai_id=VOICE_AI,
+        )
+        GAME_TTS_MANAGERS[game_id] = manager
+
+    if APP_LOOP:
+        asyncio.run_coroutine_threadsafe(manager.start(), APP_LOOP)
+    else:
+        logger.warning("App loop not available; cannot start TTS manager")
+    return manager
+
+
+def shutdown_tts_manager(game_id: str) -> None:
+    with GAME_TTS_LOCK:
+        manager = GAME_TTS_MANAGERS.pop(game_id, None)
+    if manager and APP_LOOP:
+        asyncio.run_coroutine_threadsafe(manager.close(), APP_LOOP)
 
 
 @app.post("/start-game")
@@ -391,6 +508,10 @@ def stream_game_state(game_id: str) -> None:
                     continue
 
                 if event_type == "gameState":
+                    status = event.get("status")
+                    if status and status != "started":
+                        logger.info("Game finished with status=%s", status)
+                        break
                     moves_text = event.get("moves", "")
                     moves = moves_text.split() if moves_text else []
 
@@ -408,6 +529,8 @@ def stream_game_state(game_id: str) -> None:
                     LAST_PROCESSED_MOVE_COUNT = len(moves)
     except requests.RequestException as exc:
         logger.warning("Lichess stream request failed: %s", exc)
+    finally:
+        shutdown_tts_manager(game_id)
 
 
 @app.get("/debug/stream/{game_id}")
@@ -507,63 +630,6 @@ def debug_gradium_test():
     return Response(content=response.content, media_type="application/octet-stream")
 
 
-@app.post("/tts")
-async def tts(payload: dict):
-    text = (payload or {}).get("text")
-    if not text:
-        raise HTTPException(status_code=400, detail="Missing text")
-    role = (payload or {}).get("role")
-    if role not in {"PLAYER_MOVE", "AI_MOVE"}:
-        raise HTTPException(status_code=400, detail="Missing or invalid role")
-
-    gradium_key = os.getenv("GRADIUM_API_KEY")
-    if not gradium_key:
-        raise HTTPException(status_code=500, detail="GRADIUM_API_KEY not set")
-
-    voice_id = VOICE_COACH if role == "PLAYER_MOVE" else VOICE_AI
-    voice_label = "VOICE_COACH" if role == "PLAYER_MOVE" else "VOICE_AI"
-    if not voice_id:
-        raise HTTPException(
-            status_code=500,
-            detail=f"{voice_label} not set",
-        )
-    logger.info("TTS | role=%s | voice=%s", role, voice_label)
-
-    ensure_audio_dir()
-    client = GradiumClient(api_key=gradium_key)
-    async with TTS_LOCK:
-        await throttle_tts_calls()
-        try:
-            result = await client.tts(
-                setup={
-                    "model_name": "default",
-                    "voice_id": voice_id,
-                    "output_format": "wav",
-                },
-                text=text,
-            )
-        except Exception as exc:
-            logger.warning("Gradium TTS request failed: %s", exc)
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    audio_id = f"{uuid.uuid4().hex}.wav"
-    file_path = AUDIO_DIR / audio_id
-    file_path.write_bytes(result.raw_data)
-
-    return {"audio_url": f"/audio/{audio_id}"}
-
-
-@app.get("/audio/{filename}")
-def audio(filename: str):
-    safe_name = os.path.basename(filename)
-    if safe_name != filename:
-        raise HTTPException(status_code=400, detail="Invalid filename")
-
-    file_path = AUDIO_DIR / safe_name
-    if not file_path.is_file():
-        raise HTTPException(status_code=404, detail="Audio file not found")
-
-    return FileResponse(str(file_path), media_type="audio/wav")
 
 
 def enqueue_commentary(game_id: str, move_uci: str, role: str) -> None:
@@ -625,6 +691,11 @@ def process_commentary_queue() -> None:
                 commentary.replace('"', "'"),
             )
             publish_commentary_event(game_id, role, commentary, move_uci)
+            manager = ensure_tts_manager(game_id)
+            if manager and APP_LOOP:
+                asyncio.run_coroutine_threadsafe(
+                    manager.speak(role, commentary), APP_LOOP
+                )
 
 
 def generate_commentary_mistral(move_uci: str, role: str) -> str | None:
@@ -757,29 +828,15 @@ def throttle_mistral_calls() -> None:
     time.sleep(sleep_for)
 
 
-async def throttle_tts_calls() -> None:
-    global LAST_TTS_CALL_AT
-
-    now = time.monotonic()
-    if LAST_TTS_CALL_AT is None:
-        LAST_TTS_CALL_AT = now
-        return
-    elapsed = now - LAST_TTS_CALL_AT
-    delay = max(0.0, 1.0 - elapsed)
-    if delay:
-        await asyncio.sleep(delay)
-    LAST_TTS_CALL_AT = time.monotonic()
-
-
-def get_commentary_queue(game_id: str) -> asyncio.Queue:
+def get_event_queue(game_id: str) -> asyncio.Queue:
     loop = asyncio.get_running_loop()
-    with COMMENTARY_SUBSCRIBERS_LOCK:
-        entry = COMMENTARY_SUBSCRIBERS.get(game_id)
+    with EVENT_SUBSCRIBERS_LOCK:
+        entry = EVENT_SUBSCRIBERS.get(game_id)
         if entry and entry["loop"] is loop:
             entry["subscribers"] += 1
             return entry["queue"]
         queue: asyncio.Queue = asyncio.Queue()
-        COMMENTARY_SUBSCRIBERS[game_id] = {
+        EVENT_SUBSCRIBERS[game_id] = {
             "queue": queue,
             "loop": loop,
             "subscribers": 1,
@@ -787,45 +844,55 @@ def get_commentary_queue(game_id: str) -> asyncio.Queue:
         return queue
 
 
-def release_commentary_queue(game_id: str) -> None:
-    with COMMENTARY_SUBSCRIBERS_LOCK:
-        entry = COMMENTARY_SUBSCRIBERS.get(game_id)
+def release_event_queue(game_id: str) -> None:
+    with EVENT_SUBSCRIBERS_LOCK:
+        entry = EVENT_SUBSCRIBERS.get(game_id)
         if not entry:
             return
         entry["subscribers"] -= 1
         if entry["subscribers"] <= 0:
-            COMMENTARY_SUBSCRIBERS.pop(game_id, None)
+            EVENT_SUBSCRIBERS.pop(game_id, None)
 
 
-def publish_commentary_event(game_id: str, role: str, text: str, move: str) -> None:
-    with COMMENTARY_SUBSCRIBERS_LOCK:
-        entry = COMMENTARY_SUBSCRIBERS.get(game_id)
+def publish_event(game_id: str, event: str, payload: dict) -> None:
+    with EVENT_SUBSCRIBERS_LOCK:
+        entry = EVENT_SUBSCRIBERS.get(game_id)
         if not entry:
             return
         queue = entry["queue"]
         loop = entry["loop"]
 
-    payload = {"role": role, "text": text, "move": move}
+    message = {"event": event, "payload": payload}
     try:
-        asyncio.run_coroutine_threadsafe(queue.put(payload), loop)
+        asyncio.run_coroutine_threadsafe(queue.put(message), loop)
     except RuntimeError as exc:
-        logger.warning("Failed to publish commentary event: %s", exc)
+        logger.warning("Failed to publish event: %s", exc)
+
+
+def publish_commentary_event(game_id: str, role: str, text: str, move: str) -> None:
+    publish_event(
+        game_id,
+        "commentary",
+        {"role": role, "text": text, "move": move},
+    )
 
 
 @app.get("/events/{game_id}")
 async def events(game_id: str):
-    queue = get_commentary_queue(game_id)
+    queue = get_event_queue(game_id)
 
     async def event_stream():
         try:
             while True:
-                payload = await queue.get()
+                message = await queue.get()
+                event = message.get("event", "commentary")
+                payload = message.get("payload", {})
                 data = json.dumps(payload, ensure_ascii=False)
-                yield f"event: commentary\ndata: {data}\n\n"
+                yield f"event: {event}\ndata: {data}\n\n"
         except asyncio.CancelledError:
             raise
         finally:
-            release_commentary_queue(game_id)
+            release_event_queue(game_id)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -903,11 +970,28 @@ def demo():
       const ttsStatusEl = document.getElementById("tts-status");
 
       const audioQueue = [];
-      let pendingAiEntry = null;
       let isPlaying = false;
-      let lastPlayedRole = null;
-      const playedAudios = new Set();
       let pendingTtsCount = 0;
+      let audioContext = null;
+      let decodeChain = Promise.resolve();
+
+      function ensureAudioContext() {
+        if (!audioContext) {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioContext.state === "suspended") {
+          audioContext.resume().catch(() => {});
+        }
+      }
+
+      function base64ToArrayBuffer(base64) {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        return bytes.buffer;
+      }
 
       function log(message) {
         const line = `[${new Date().toLocaleTimeString()}] ${message}\\n`;
@@ -936,118 +1020,50 @@ def demo():
         }
       }
 
-      async function requestTts(text, role) {
-        const response = await fetch("/tts", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text, role }),
-        });
-        if (!response.ok) {
-          return null;
-        }
-        return response.json();
-      }
-
-      function createAudioEntry(payload) {
-        const entry = {
-          role: payload.role,
-          text: payload.text,
-          audioUrl: null,
-          audioPromise: null,
-        };
-        markTtsPending();
-        entry.audioPromise = requestTts(payload.text, payload.role)
-          .then((data) => {
-            if (!data || !data.audio_url) {
-              return null;
-            }
-            entry.audioUrl = data.audio_url;
-            return data.audio_url;
-          })
-          .catch(() => null)
-          .finally(() => markTtsComplete());
-        return entry;
-      }
-
       async function playNextAudio() {
         if (isPlaying) {
           return;
         }
-        const entry = audioQueue.shift();
-        if (!entry) {
+        const buffer = audioQueue.shift();
+        if (!buffer) {
           return;
         }
+        ensureAudioContext();
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioContext.destination);
         isPlaying = true;
-        const audioUrl = await entry.audioPromise;
-        if (!audioUrl || playedAudios.has(audioUrl)) {
-          ttsStatusEl.textContent = audioUrl ? "idle" : "error";
-          ttsStatusEl.classList.remove("connected");
-          isPlaying = false;
-          if (entry.role === "PLAYER_MOVE" && pendingAiEntry) {
-            audioQueue.push(pendingAiEntry);
-            pendingAiEntry = null;
-          }
-          playNextAudio();
-          return;
-        }
-        playedAudios.add(audioUrl);
-        const audio = document.createElement("audio");
-        audio.src = audioUrl;
-        audio.autoplay = true;
-        audio.style.display = "none";
-        audio.addEventListener("play", () => {
-          clearThinking();
-          ttsStatusEl.textContent = "playing";
-          ttsStatusEl.classList.add("connected");
-        });
-        audio.addEventListener("ended", () => {
-          audio.remove();
+        source.addEventListener("ended", () => {
           ttsStatusEl.textContent = "idle";
           ttsStatusEl.classList.remove("connected");
           isPlaying = false;
-          lastPlayedRole = entry.role;
-          if (entry.role === "PLAYER_MOVE" && pendingAiEntry) {
-            audioQueue.push(pendingAiEntry);
-            pendingAiEntry = null;
-          }
           playNextAudio();
         });
-        document.body.appendChild(audio);
-      }
-
-      function handlePlayerCommentary(payload) {
-        if (!payload || !payload.text) {
-          return;
-        }
-        log(`${payload.role}: ${payload.text}`);
-        const entry = createAudioEntry(payload);
-        audioQueue.push(entry);
-        playNextAudio();
-      }
-
-      function handleAiCommentary(payload) {
-        if (!payload || !payload.text) {
-          return;
-        }
-        log(`${payload.role}: ${payload.text}`);
-        const entry = createAudioEntry(payload);
-        if (isPlaying || lastPlayedRole !== "PLAYER_MOVE") {
-          pendingAiEntry = entry;
-          return;
-        }
-        audioQueue.push(entry);
-        playNextAudio();
+        clearThinking();
+        ttsStatusEl.textContent = "playing";
+        ttsStatusEl.classList.add("connected");
+        source.start();
       }
 
       function handleCommentary(payload) {
         if (!payload || !payload.text || !payload.role) {
           return;
         }
-        if (payload.role === "PLAYER_MOVE") {
-          handlePlayerCommentary(payload);
-        } else if (payload.role === "AI_MOVE") {
-          handleAiCommentary(payload);
-        }
+        log(`${payload.role}: ${payload.text}`);
+      }
+
+      function enqueueAudioChunk(chunk) {
+        ensureAudioContext();
+        decodeChain = decodeChain
+          .then(() => audioContext.decodeAudioData(base64ToArrayBuffer(chunk)))
+          .then((buffer) => {
+            audioQueue.push(buffer);
+            playNextAudio();
+          })
+          .catch(() => {
+            ttsStatusEl.textContent = "error";
+            ttsStatusEl.classList.remove("connected");
+          });
       }
 
       async function startDemo() {
@@ -1066,6 +1082,22 @@ def demo():
             return;
           }
         });
+        eventSource.addEventListener("tts-start", () => {
+          markTtsPending();
+        });
+        eventSource.addEventListener("tts-audio", (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload && payload.chunk) {
+              enqueueAudioChunk(payload.chunk);
+            }
+          } catch (error) {
+            return;
+          }
+        });
+        eventSource.addEventListener("tts-end", () => {
+          markTtsComplete();
+        });
         eventSource.addEventListener("open", () => {
           sseStatusEl.textContent = "connected";
           sseStatusEl.classList.add("connected");
@@ -1077,6 +1109,10 @@ def demo():
       }
 
       startDemo();
+
+      document.addEventListener("click", () => {
+        ensureAudioContext();
+      });
     </script>
   </body>
 </html>

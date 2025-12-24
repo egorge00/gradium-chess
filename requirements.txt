@@ -3,3 +3,4 @@ google-genai
 gradium
 requests
 uvicorn
+websockets
