@@ -83,6 +83,10 @@ def demo_root():
       const audioQueue = [];
       let isPlaying = false;
       let pendingTtsCount = 0;
+      const ttsWatchdogs = new Map();
+      const ttsPendingIds = new Set();
+      let ttsWatchdogCounter = 0;
+      const TTS_WATCHDOG_MS = 15000;
       let audioContext = null;
       let decodeChain = Promise.resolve();
 
@@ -121,6 +125,38 @@ def demo_root():
         pendingTtsCount = Math.max(0, pendingTtsCount - 1);
         if (pendingTtsCount === 0) {
           clearThinking();
+        }
+      }
+
+      function startTtsWatchdog(utteranceId) {
+        const key = utteranceId || `local-${++ttsWatchdogCounter}`;
+        const existing = ttsWatchdogs.get(key);
+        if (existing) {
+          clearTimeout(existing);
+        }
+        ttsPendingIds.add(key);
+        const timer = setTimeout(() => {
+          console.warn("tts watchdog fired", key);
+          ttsWatchdogs.delete(key);
+          if (ttsPendingIds.delete(key)) {
+            markTtsComplete();
+          }
+        }, TTS_WATCHDOG_MS);
+        ttsWatchdogs.set(key, timer);
+        return key;
+      }
+
+      function clearTtsWatchdog(utteranceId) {
+        if (!utteranceId) {
+          return;
+        }
+        const timer = ttsWatchdogs.get(utteranceId);
+        if (timer) {
+          clearTimeout(timer);
+          ttsWatchdogs.delete(utteranceId);
+        }
+        if (ttsPendingIds.delete(utteranceId)) {
+          markTtsComplete();
         }
       }
 
@@ -175,8 +211,16 @@ def demo_root():
             return;
           }
         });
-        eventSource.addEventListener("tts-start", () => {
+        eventSource.addEventListener("tts-start", (event) => {
+          let utteranceId;
+          try {
+            const payload = JSON.parse(event.data);
+            utteranceId = payload && payload.utterance_id;
+          } catch (error) {
+            utteranceId = undefined;
+          }
           markTtsPending();
+          startTtsWatchdog(utteranceId);
         });
         eventSource.addEventListener("tts-audio", (event) => {
           try {
@@ -188,8 +232,15 @@ def demo_root():
             return;
           }
         });
-        eventSource.addEventListener("tts-end", () => {
-          markTtsComplete();
+        eventSource.addEventListener("tts-end", (event) => {
+          let utteranceId;
+          try {
+            const payload = JSON.parse(event.data);
+            utteranceId = payload && payload.utterance_id;
+          } catch (error) {
+            utteranceId = undefined;
+          }
+          clearTtsWatchdog(utteranceId);
         });
       }
 
@@ -250,23 +301,39 @@ class GradiumTTSManager:
             {"role": role, "text": text, "utterance_id": utterance_id},
         )
         logger.info("TTS connecting")
-        async with websockets.connect(
-            "wss://eu.api.gradium.ai/api/speech/tts",
-            additional_headers={"x-api-key": self.api_key},
-            max_size=None,
-        ) as ws:
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "setup",
-                        "model_name": "default",
-                        "voice_id": voice_id,
-                        "output_format": "wav",
-                    }
+        ended = False
+        try:
+            async with websockets.connect(
+                "wss://eu.api.gradium.ai/api/speech/tts",
+                additional_headers={"x-api-key": self.api_key},
+                max_size=None,
+            ) as ws:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "setup",
+                            "model_name": "default",
+                            "voice_id": voice_id,
+                            "output_format": "wav",
+                        }
+                    )
                 )
-            )
-            await ws.send(json.dumps({"type": "text", "text": text, "flush": True}))
-            await self._stream_audio(ws, game_id, role, text, utterance_id)
+                await ws.send(json.dumps({"type": "text", "text": text, "flush": True}))
+                await self._stream_audio(ws, game_id, role, text, utterance_id)
+        finally:
+            if not ended:
+                publish_event(
+                    game_id,
+                    "tts-end",
+                    {"role": role, "text": text, "utterance_id": utterance_id},
+                )
+                logger.info(
+                    "TTS end emitted | game_id=%s utterance_id=%s role=%s",
+                    game_id,
+                    utterance_id,
+                    role,
+                )
+                ended = True
 
     async def _stream_audio(
         self,
@@ -278,12 +345,27 @@ class GradiumTTSManager:
     ) -> None:
         sequence = 0
         while True:
-            message = await ws.recv()
+            try:
+                message = await ws.recv()
+            except (
+                websockets.exceptions.ConnectionClosed,
+                websockets.exceptions.ConnectionClosedError,
+            ) as exc:
+                logger.warning("TTS connection closed | reason=%s", exc)
+                break
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
                 continue
-            message_type = data.get("type")
+            if isinstance(data, str):
+                message_type = data
+            elif isinstance(data, dict):
+                message_type = data.get("type")
+            else:
+                continue
+            if message_type is None:
+                continue
+            message_type = str(message_type).lower()
             if message_type == "audio":
                 raw = data.get("audio")
                 if not raw:
@@ -302,17 +384,11 @@ class GradiumTTSManager:
                 logger.info("TTS audio chunk | sequence=%s", sequence)
                 sequence += 1
                 continue
-            if message_type in {"end", "end_of_stream", "done"}:
+            if message_type in {"done", "end", "final", "eos", "eof", "end_of_stream"}:
                 logger.info("TTS eos")
                 break
             if message_type == "error":
                 raise RuntimeError(data.get("message") or "TTS error")
-
-        publish_event(
-            game_id,
-            "tts-end",
-            {"role": role, "text": text, "utterance_id": utterance_id},
-        )
 
 
 def start_game_internal(
@@ -989,6 +1065,10 @@ def demo():
       const audioQueue = [];
       let isPlaying = false;
       let pendingTtsCount = 0;
+      const ttsWatchdogs = new Map();
+      const ttsPendingIds = new Set();
+      let ttsWatchdogCounter = 0;
+      const TTS_WATCHDOG_MS = 15000;
       let audioContext = null;
       let decodeChain = Promise.resolve();
 
@@ -1034,6 +1114,38 @@ def demo():
         pendingTtsCount = Math.max(0, pendingTtsCount - 1);
         if (pendingTtsCount === 0) {
           clearThinking();
+        }
+      }
+
+      function startTtsWatchdog(utteranceId) {
+        const key = utteranceId || `local-${++ttsWatchdogCounter}`;
+        const existing = ttsWatchdogs.get(key);
+        if (existing) {
+          clearTimeout(existing);
+        }
+        ttsPendingIds.add(key);
+        const timer = setTimeout(() => {
+          console.warn("tts watchdog fired", key);
+          ttsWatchdogs.delete(key);
+          if (ttsPendingIds.delete(key)) {
+            markTtsComplete();
+          }
+        }, TTS_WATCHDOG_MS);
+        ttsWatchdogs.set(key, timer);
+        return key;
+      }
+
+      function clearTtsWatchdog(utteranceId) {
+        if (!utteranceId) {
+          return;
+        }
+        const timer = ttsWatchdogs.get(utteranceId);
+        if (timer) {
+          clearTimeout(timer);
+          ttsWatchdogs.delete(utteranceId);
+        }
+        if (ttsPendingIds.delete(utteranceId)) {
+          markTtsComplete();
         }
       }
 
@@ -1099,8 +1211,16 @@ def demo():
             return;
           }
         });
-        eventSource.addEventListener("tts-start", () => {
+        eventSource.addEventListener("tts-start", (event) => {
+          let utteranceId;
+          try {
+            const payload = JSON.parse(event.data);
+            utteranceId = payload && payload.utterance_id;
+          } catch (error) {
+            utteranceId = undefined;
+          }
           markTtsPending();
+          startTtsWatchdog(utteranceId);
         });
         eventSource.addEventListener("tts-audio", (event) => {
           try {
@@ -1112,8 +1232,15 @@ def demo():
             return;
           }
         });
-        eventSource.addEventListener("tts-end", () => {
-          markTtsComplete();
+        eventSource.addEventListener("tts-end", (event) => {
+          let utteranceId;
+          try {
+            const payload = JSON.parse(event.data);
+            utteranceId = payload && payload.utterance_id;
+          } catch (error) {
+            utteranceId = undefined;
+          }
+          clearTtsWatchdog(utteranceId);
         });
         eventSource.addEventListener("open", () => {
           sseStatusEl.textContent = "connected";
