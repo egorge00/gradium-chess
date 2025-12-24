@@ -258,7 +258,7 @@ class GradiumTTSManager:
         await future
 
     async def _ensure_connected(self) -> None:
-        if self._ws and not self._ws.closed:
+        if self._ws and self._ws.close_code is None:
             return
         self._ws = None
         if self._reconnect_attempted:
