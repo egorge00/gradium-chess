@@ -83,7 +83,6 @@ def demo_root():
       const button = document.getElementById("start-demo");
       const ttsFeedbackEl = document.getElementById("tts-feedback");
       let audioContext = null;
-      const PCM_SAMPLE_RATE = 24000;
       const utteranceStates = new Map();
       const utteranceQueue = [];
       let currentUtteranceId = null;
@@ -110,19 +109,13 @@ def demo_root():
         ttsFeedbackEl.textContent = "";
       }
 
-      function decodeBase64ToFloat32(base64Chunk) {
+      function decodeBase64ToArrayBuffer(base64Chunk) {
         const binary = atob(base64Chunk);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i += 1) {
           bytes[i] = binary.charCodeAt(i);
         }
-        const sampleCount = Math.floor(bytes.byteLength / 2);
-        const samples = new Float32Array(sampleCount);
-        const int16View = new DataView(bytes.buffer);
-        for (let i = 0; i < sampleCount; i += 1) {
-          samples[i] = int16View.getInt16(i * 2, true) / 32768;
-        }
-        return samples;
+        return bytes.buffer;
       }
 
       function playAudioBuffer(buffer) {
@@ -136,16 +129,15 @@ def demo_root():
         });
       }
 
-      function playChunk(base64Chunk) {
+      function playWav(base64Chunk) {
         ensureAudioContext();
-        const samples = decodeBase64ToFloat32(base64Chunk);
-        const buffer = audioContext.createBuffer(
-          1,
-          samples.length,
-          PCM_SAMPLE_RATE
-        );
-        buffer.copyToChannel(samples, 0);
-        return playAudioBuffer(buffer);
+        const wavBuffer = decodeBase64ToArrayBuffer(base64Chunk);
+        return audioContext
+          .decodeAudioData(wavBuffer)
+          .then((decoded) => playAudioBuffer(decoded))
+          .catch((error) => {
+            console.log("decodeAudioData failed", error);
+          });
       }
 
       function getOrCreateUtterance(utteranceId) {
@@ -202,7 +194,7 @@ def demo_root():
           console.log(`play chunk u=${currentUtteranceId} seq=${sequence}`);
           chunksInFlight += 1;
           playbackChain = playbackChain
-            .then(() => playChunk(chunk))
+            .then(() => playWav(chunk))
             .finally(() => {
               chunksInFlight = Math.max(0, chunksInFlight - 1);
               maybeAdvanceUtterance();
@@ -413,7 +405,7 @@ class GradiumTTSManager:
                 {"role": role, "text": text, "utterance_id": utterance_id},
             )
             logger.info(
-                "TTS end emitted | game_id=%s utterance_id=%s role=%s",
+                "TTS end published | game_id=%s utterance_id=%s role=%s",
                 game_id,
                 utterance_id,
                 role,
@@ -469,8 +461,7 @@ class GradiumTTSManager:
         text: str,
         utterance_id: str,
     ) -> None:
-        sequence = 0
-        total_bytes = 0
+        wav_bytes = bytearray()
         while True:
             try:
                 message = await ws.recv()
@@ -478,7 +469,10 @@ class GradiumTTSManager:
                 websockets.exceptions.ConnectionClosed,
                 websockets.exceptions.ConnectionClosedError,
             ) as exc:
-                logger.info("TTS connection closed | reason=%s", exc)
+                if getattr(exc, "code", None) == 1000:
+                    logger.info("TTS connection closed (normal) | reason=%s", exc)
+                else:
+                    logger.info("TTS connection closed | reason=%s", exc)
                 break
             try:
                 data = json.loads(message)
@@ -501,33 +495,33 @@ class GradiumTTSManager:
                     decoded = base64.b64decode(raw)
                 except (binascii.Error, TypeError) as exc:
                     logger.warning(
-                        "TTS audio chunk decode failed | sequence=%s error=%s",
-                        sequence,
+                        "TTS audio chunk decode failed | error=%s",
                         exc,
                     )
                 else:
-                    encoded = base64.b64encode(decoded).decode("ascii")
-                    total_bytes += len(decoded)
-                    publish_event(
-                        game_id,
-                        "tts-audio",
-                        {
-                            "role": role,
-                            "text": text,
-                            "utterance_id": utterance_id,
-                            "sequence": sequence,
-                            "chunk": encoded,
-                        },
-                    )
-                    logger.info("TTS audio chunk | sequence=%s", sequence)
-                sequence += 1
+                    wav_bytes.extend(decoded)
                 continue
             if message_type in {"done", "end", "final", "eos", "eof", "end_of_stream"}:
                 logger.info("TTS eos")
                 break
             if message_type == "error":
                 raise RuntimeError(data.get("message") or "TTS error")
-        logger.info("TTS utterance bytes=%s", total_bytes)
+        if wav_bytes:
+            encoded = base64.b64encode(bytes(wav_bytes)).decode("ascii")
+            publish_event(
+                game_id,
+                "tts-audio",
+                {
+                    "role": role,
+                    "text": text,
+                    "utterance_id": utterance_id,
+                    "sequence": 0,
+                    "chunk": encoded,
+                },
+            )
+            logger.info("TTS publish wav bytes=%s", len(wav_bytes))
+        else:
+            logger.info("TTS publish wav bytes=0")
 
 
 def start_game_internal(
