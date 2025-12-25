@@ -83,11 +83,7 @@ def demo_root():
       const button = document.getElementById("start-demo");
       const ttsFeedbackEl = document.getElementById("tts-feedback");
       let audioContext = null;
-      const utteranceStates = new Map();
-      const utteranceQueue = [];
       let currentUtteranceId = null;
-      let playbackChain = Promise.resolve();
-      let chunksInFlight = 0;
 
       function ensureAudioContext() {
         if (!audioContext) {
@@ -109,8 +105,8 @@ def demo_root():
         ttsFeedbackEl.textContent = "";
       }
 
-      function decodeBase64ToArrayBuffer(base64Chunk) {
-        const binary = atob(base64Chunk);
+      function decodeBase64ToArrayBuffer(base64Audio) {
+        const binary = atob(base64Audio);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i += 1) {
           bytes[i] = binary.charCodeAt(i);
@@ -118,94 +114,15 @@ def demo_root():
         return bytes.buffer;
       }
 
-      function playAudioBuffer(buffer) {
-        return new Promise((resolve) => {
-          ensureAudioContext();
+      function playWav(base64Audio) {
+        ensureAudioContext();
+        const wavBuffer = decodeBase64ToArrayBuffer(base64Audio);
+        return audioContext.decodeAudioData(wavBuffer).then((decoded) => {
           const source = audioContext.createBufferSource();
-          source.buffer = buffer;
+          source.buffer = decoded;
           source.connect(audioContext.destination);
-          source.addEventListener("ended", resolve);
           source.start();
         });
-      }
-
-      function playWav(base64Chunk) {
-        ensureAudioContext();
-        const wavBuffer = decodeBase64ToArrayBuffer(base64Chunk);
-        return audioContext
-          .decodeAudioData(wavBuffer)
-          .then((decoded) => playAudioBuffer(decoded))
-          .catch((error) => {
-            console.log("decodeAudioData failed", error);
-          });
-      }
-
-      function getOrCreateUtterance(utteranceId) {
-        if (!utteranceStates.has(utteranceId)) {
-          utteranceStates.set(utteranceId, {
-            expectedSequence: 0,
-            pendingChunks: new Map(),
-            ended: false,
-          });
-        }
-        return utteranceStates.get(utteranceId);
-      }
-
-      function setCurrentUtterance(utteranceId) {
-        currentUtteranceId = utteranceId;
-        showThinking();
-        drainCurrentChunks();
-      }
-
-      function maybeAdvanceUtterance() {
-        if (!currentUtteranceId) {
-          return;
-        }
-        const state = utteranceStates.get(currentUtteranceId);
-        if (!state) {
-          return;
-        }
-        if (!state.ended || state.pendingChunks.size > 0 || chunksInFlight > 0) {
-          return;
-        }
-        utteranceStates.delete(currentUtteranceId);
-        currentUtteranceId = null;
-        if (utteranceQueue.length > 0) {
-          const nextId = utteranceQueue.shift();
-          setCurrentUtterance(nextId);
-        } else {
-          clearThinking();
-        }
-      }
-
-      function drainCurrentChunks() {
-        if (!currentUtteranceId) {
-          return;
-        }
-        const state = utteranceStates.get(currentUtteranceId);
-        if (!state) {
-          return;
-        }
-        while (state.pendingChunks.has(state.expectedSequence)) {
-          const sequence = state.expectedSequence;
-          const chunk = state.pendingChunks.get(sequence);
-          state.pendingChunks.delete(sequence);
-          state.expectedSequence += 1;
-          console.log(`play chunk u=${currentUtteranceId} seq=${sequence}`);
-          chunksInFlight += 1;
-          playbackChain = playbackChain
-            .then(() => playWav(chunk))
-            .finally(() => {
-              chunksInFlight = Math.max(0, chunksInFlight - 1);
-              maybeAdvanceUtterance();
-            });
-        }
-        if (
-          state.pendingChunks.size > 0 &&
-          !state.pendingChunks.has(state.expectedSequence)
-        ) {
-          console.log(`gap waiting for seq=${state.expectedSequence}`);
-        }
       }
 
       async function startDemo() {
@@ -239,28 +156,16 @@ def demo_root():
           if (!utteranceId) {
             return;
           }
-          getOrCreateUtterance(utteranceId);
-          if (!currentUtteranceId) {
-            setCurrentUtterance(utteranceId);
-          } else {
-            utteranceQueue.push(utteranceId);
-          }
+          currentUtteranceId = utteranceId;
+          showThinking();
         });
         eventSource.addEventListener("tts-audio", (event) => {
           try {
             const payload = JSON.parse(event.data);
-            if (payload && payload.chunk && payload.utterance_id != null) {
-              const utteranceId = payload.utterance_id;
-              const sequence = Number(payload.sequence);
-              console.log(`received chunk u=${utteranceId} seq=${sequence}`);
-              const state = getOrCreateUtterance(utteranceId);
-              state.pendingChunks.set(sequence, payload.chunk);
-              if (!currentUtteranceId) {
-                setCurrentUtterance(utteranceId);
-              }
-              if (utteranceId === currentUtteranceId) {
-                drainCurrentChunks();
-              }
+            if (payload && payload.audio && payload.utterance_id != null) {
+              playWav(payload.audio).catch((error) => {
+                console.log("decodeAudioData failed", error);
+              });
             }
           } catch (error) {
             return;
@@ -278,11 +183,10 @@ def demo_root():
             return;
           }
           console.log(`tts-end u=${utteranceId}`);
-          const state = getOrCreateUtterance(utteranceId);
-          state.ended = true;
           if (utteranceId === currentUtteranceId) {
-            maybeAdvanceUtterance();
+            currentUtteranceId = null;
           }
+          clearThinking();
         });
       }
 
@@ -506,22 +410,20 @@ class GradiumTTSManager:
                 break
             if message_type == "error":
                 raise RuntimeError(data.get("message") or "TTS error")
-        if wav_bytes:
-            encoded = base64.b64encode(bytes(wav_bytes)).decode("ascii")
-            publish_event(
-                game_id,
-                "tts-audio",
-                {
-                    "role": role,
-                    "text": text,
-                    "utterance_id": utterance_id,
-                    "sequence": 0,
-                    "chunk": encoded,
-                },
-            )
-            logger.info("TTS publish wav bytes=%s", len(wav_bytes))
-        else:
+        if not wav_bytes:
             logger.info("TTS publish wav bytes=0")
+            return
+        encoded = base64.b64encode(bytes(wav_bytes)).decode("ascii")
+        publish_event(
+            game_id,
+            "tts-audio",
+            {
+                "role": role,
+                "utterance_id": utterance_id,
+                "audio": encoded,
+            },
+        )
+        logger.info("TTS publish wav bytes=%s", len(wav_bytes))
 
 
 def start_game_internal(
@@ -1196,12 +1098,7 @@ def demo():
       const ttsStatusEl = document.getElementById("tts-status");
 
       let audioContext = null;
-      const PCM_SAMPLE_RATE = 24000;
-      const utteranceStates = new Map();
-      const utteranceQueue = [];
       let currentUtteranceId = null;
-      let playbackChain = Promise.resolve();
-      let chunksInFlight = 0;
 
       function ensureAudioContext() {
         if (!audioContext) {
@@ -1212,19 +1109,13 @@ def demo():
         }
       }
 
-      function base64ToPcmSamples(base64) {
-        const binary = atob(base64);
+      function decodeBase64ToArrayBuffer(base64Audio) {
+        const binary = atob(base64Audio);
         const bytes = new Uint8Array(binary.length);
         for (let i = 0; i < binary.length; i += 1) {
           bytes[i] = binary.charCodeAt(i);
         }
-        const sampleCount = Math.floor(bytes.byteLength / 2);
-        const samples = new Float32Array(sampleCount);
-        const view = new DataView(bytes.buffer);
-        for (let i = 0; i < sampleCount; i += 1) {
-          samples[i] = view.getInt16(i * 2, true) / 32768;
-        }
-        return samples;
+        return bytes.buffer;
       }
 
       function log(message) {
@@ -1242,27 +1133,15 @@ def demo():
         ttsStatusEl.classList.remove("connected");
       }
 
-      function playAudioBuffer(buffer) {
-        return new Promise((resolve) => {
-          ensureAudioContext();
+      function playWav(base64Audio) {
+        ensureAudioContext();
+        const wavBuffer = decodeBase64ToArrayBuffer(base64Audio);
+        return audioContext.decodeAudioData(wavBuffer).then((decoded) => {
           const source = audioContext.createBufferSource();
-          source.buffer = buffer;
+          source.buffer = decoded;
           source.connect(audioContext.destination);
-          source.addEventListener("ended", resolve);
           source.start();
         });
-      }
-
-      function playChunk(base64Chunk) {
-        ensureAudioContext();
-        const samples = base64ToPcmSamples(base64Chunk);
-        const buffer = audioContext.createBuffer(
-          1,
-          samples.length,
-          PCM_SAMPLE_RATE
-        );
-        buffer.copyToChannel(samples, 0);
-        return playAudioBuffer(buffer);
       }
 
       function handleCommentary(payload) {
@@ -1270,74 +1149,6 @@ def demo():
           return;
         }
         log(`${payload.role}: ${payload.text}`);
-      }
-
-      function getOrCreateUtterance(utteranceId) {
-        if (!utteranceStates.has(utteranceId)) {
-          utteranceStates.set(utteranceId, {
-            expectedSequence: 0,
-            pendingChunks: new Map(),
-            ended: false,
-          });
-        }
-        return utteranceStates.get(utteranceId);
-      }
-
-      function setCurrentUtterance(utteranceId) {
-        currentUtteranceId = utteranceId;
-        showThinking();
-        drainCurrentChunks();
-      }
-
-      function maybeAdvanceUtterance() {
-        if (!currentUtteranceId) {
-          return;
-        }
-        const state = utteranceStates.get(currentUtteranceId);
-        if (!state) {
-          return;
-        }
-        if (!state.ended || state.pendingChunks.size > 0 || chunksInFlight > 0) {
-          return;
-        }
-        utteranceStates.delete(currentUtteranceId);
-        currentUtteranceId = null;
-        if (utteranceQueue.length > 0) {
-          const nextId = utteranceQueue.shift();
-          setCurrentUtterance(nextId);
-        } else {
-          clearThinking();
-        }
-      }
-
-      function drainCurrentChunks() {
-        if (!currentUtteranceId) {
-          return;
-        }
-        const state = utteranceStates.get(currentUtteranceId);
-        if (!state) {
-          return;
-        }
-        while (state.pendingChunks.has(state.expectedSequence)) {
-          const sequence = state.expectedSequence;
-          const chunk = state.pendingChunks.get(sequence);
-          state.pendingChunks.delete(sequence);
-          state.expectedSequence += 1;
-          console.log(`play chunk u=${currentUtteranceId} seq=${sequence}`);
-          chunksInFlight += 1;
-          playbackChain = playbackChain
-            .then(() => playChunk(chunk))
-            .finally(() => {
-              chunksInFlight = Math.max(0, chunksInFlight - 1);
-              maybeAdvanceUtterance();
-            });
-        }
-        if (
-          state.pendingChunks.size > 0 &&
-          !state.pendingChunks.has(state.expectedSequence)
-        ) {
-          console.log(`gap waiting for seq=${state.expectedSequence}`);
-        }
       }
 
       async function startDemo() {
@@ -1367,28 +1178,16 @@ def demo():
           if (!utteranceId) {
             return;
           }
-          getOrCreateUtterance(utteranceId);
-          if (!currentUtteranceId) {
-            setCurrentUtterance(utteranceId);
-          } else {
-            utteranceQueue.push(utteranceId);
-          }
+          currentUtteranceId = utteranceId;
+          showThinking();
         });
         eventSource.addEventListener("tts-audio", (event) => {
           try {
             const payload = JSON.parse(event.data);
-            if (payload && payload.chunk && payload.utterance_id != null) {
-              const utteranceId = payload.utterance_id;
-              const sequence = Number(payload.sequence);
-              console.log(`received chunk u=${utteranceId} seq=${sequence}`);
-              const state = getOrCreateUtterance(utteranceId);
-              state.pendingChunks.set(sequence, payload.chunk);
-              if (!currentUtteranceId) {
-                setCurrentUtterance(utteranceId);
-              }
-              if (utteranceId === currentUtteranceId) {
-                drainCurrentChunks();
-              }
+            if (payload && payload.audio && payload.utterance_id != null) {
+              playWav(payload.audio).catch((error) => {
+                console.log("decodeAudioData failed", error);
+              });
             }
           } catch (error) {
             return;
@@ -1406,11 +1205,10 @@ def demo():
             return;
           }
           console.log(`tts-end u=${utteranceId}`);
-          const state = getOrCreateUtterance(utteranceId);
-          state.ended = true;
           if (utteranceId === currentUtteranceId) {
-            maybeAdvanceUtterance();
+            currentUtteranceId = null;
           }
+          clearThinking();
         });
         eventSource.addEventListener("open", () => {
           sseStatusEl.textContent = "connected";
