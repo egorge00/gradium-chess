@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -310,6 +311,8 @@ class GradiumTTSManager:
 
     async def _speak_once(self, game_id: str, role: str, text: str, voice_id: str) -> None:
         utterance_id = uuid.uuid4().hex
+        tts_start_sent = True
+        tts_end_sent = False
         publish_event(
             game_id,
             "tts-start",
@@ -319,7 +322,7 @@ class GradiumTTSManager:
                 "utterance_id": utterance_id,
                 "sample_rate": 24000,
                 "channels": 1,
-                "sample_format": "s16le",
+                "sample_format": "wav",
             },
         )
         logger.info("TTS connecting")
@@ -328,7 +331,7 @@ class GradiumTTSManager:
             ws = await self._ensure_connection()
             await self._send_setup_and_wait_ready(ws, voice_id)
             await ws.send(json.dumps({"type": "text", "text": text, "flush": True}))
-            await self._stream_audio(ws, game_id, role, text, utterance_id)
+            tts_end_sent = await self._stream_audio(ws, game_id, role, text, utterance_id)
         except Exception as exc:
             logger.warning(
                 "TTS speak failed | game_id=%s utterance_id=%s role=%s error=%s",
@@ -339,29 +342,34 @@ class GradiumTTSManager:
             )
             await self._reset_connection(ws, mark_failed=True)
         finally:
-            publish_event(
-                game_id,
-                "tts-end",
-                {"role": role, "text": text, "utterance_id": utterance_id},
-            )
-            logger.info(
-                "TTS end published | game_id=%s utterance_id=%s role=%s",
-                game_id,
-                utterance_id,
-                role,
-            )
+            if tts_start_sent and not tts_end_sent:
+                publish_event(
+                    game_id,
+                    "tts-end",
+                    {"role": role, "text": text, "utterance_id": utterance_id},
+                )
+                logger.info(
+                    "TTS end published | game_id=%s utterance_id=%s role=%s",
+                    game_id,
+                    utterance_id,
+                    role,
+                )
 
     async def _ensure_connection(self) -> websockets.WebSocketClientProtocol:
         if self._connection_failed:
             raise RuntimeError("TTS connection is unavailable")
         if self._ws and self._ws.closed:
-            self._connection_failed = True
-            raise RuntimeError("TTS connection already closed")
+            if getattr(self._ws, "close_code", None) == 1000:
+                logger.info("TTS connection closed normally; reconnecting")
+                await self._reset_connection(self._ws)
+            else:
+                self._connection_failed = True
+                raise RuntimeError("TTS connection already closed")
         if self._ws:
             return self._ws
         self._ws = await websockets.connect(
             "wss://eu.api.gradium.ai/api/speech/tts",
-            additional_headers={"x-api-key": self.api_key},
+            additional_headers={"Authorization": f"Bearer {self.api_key}"},
             max_size=None,
         )
         return self._ws
@@ -381,6 +389,7 @@ class GradiumTTSManager:
         finally:
             if ws is self._ws:
                 self._ws = None
+                self._setup_complete = False
         if mark_failed:
             self._connection_failed = True
 
@@ -403,23 +412,29 @@ class GradiumTTSManager:
                     "type": "setup",
                     "model_name": "default",
                     "voice_id": self._voice_id,
-                    "output_format": "pcm",
-                    "sample_rate": 24000,
-                    "channels": 1,
+                    "output_format": "wav",
                 }
             )
         )
-        logger.info("TTS setup sent")
-        while True:
-            message = await ws.recv()
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(data, dict) and str(data.get("type", "")).lower() == "ready":
-                logger.info("TTS ready")
-                self._setup_complete = True
-                return
+        logger.info("TTS setup sent | voice_id=%s", self._voice_id)
+        try:
+            message = await asyncio.wait_for(ws.recv(), timeout=5)
+        except asyncio.TimeoutError:
+            logger.info("TTS setup ready not received; continuing")
+            self._setup_complete = True
+            return
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            self._setup_complete = True
+            return
+        if isinstance(data, dict) and str(data.get("type", "")).lower() == "ready":
+            logger.info("TTS ready")
+            self._setup_complete = True
+            return
+        if isinstance(data, dict) and str(data.get("type", "")).lower() == "error":
+            raise RuntimeError(data.get("message") or "TTS setup error")
+        self._setup_complete = True
 
     async def _stream_audio(
         self,
@@ -428,7 +443,8 @@ class GradiumTTSManager:
         role: str,
         text: str,
         utterance_id: str,
-    ) -> None:
+    ) -> bool:
+        sequence = 0
         while True:
             try:
                 message = await ws.recv()
@@ -441,39 +457,82 @@ class GradiumTTSManager:
                 else:
                     logger.info("TTS connection closed | reason=%s", exc)
                 break
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(data, str):
-                message_type = data
-            elif isinstance(data, dict):
-                message_type = data.get("type")
-            else:
-                continue
-            if message_type is None:
-                continue
-            message_type = str(message_type).lower()
-            if message_type == "audio":
-                raw = data.get("audio") or data.get("data")
-                if not raw or not isinstance(raw, str):
-                    continue
+            if isinstance(message, (bytes, bytearray)):
+                chunk = base64.b64encode(message).decode("utf-8")
+                sequence += 1
                 publish_event(
                     game_id,
                     "tts-audio",
                     {
                         "role": role,
                         "utterance_id": utterance_id,
+                        "sequence": sequence,
+                        "chunk": chunk,
+                        "audio": chunk,
+                    },
+                )
+                logger.info("TTS publish wav chunk size=%s seq=%s", len(chunk), sequence)
+                continue
+
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                data = message
+            if isinstance(data, str):
+                message_type = data
+                data_dict = {}
+            elif isinstance(data, dict):
+                message_type = data.get("type")
+                data_dict = data
+            else:
+                continue
+            if message_type is None:
+                continue
+            message_type = str(message_type).lower()
+            raw = None
+            if isinstance(data_dict, dict):
+                raw = data_dict.get("audio") or data_dict.get("data")
+                if not raw and isinstance(data_dict.get("audio"), bytes):
+                    raw = base64.b64encode(data_dict["audio"]).decode("utf-8")
+            if raw and isinstance(raw, str):
+                sequence += 1
+                publish_event(
+                    game_id,
+                    "tts-audio",
+                    {
+                        "role": role,
+                        "utterance_id": utterance_id,
+                        "sequence": sequence,
+                        "chunk": raw,
                         "audio": raw,
                     },
                 )
-                logger.info("TTS publish pcm chunk size=%s", len(raw))
+                logger.info("TTS publish wav chunk size=%s seq=%s", len(raw), sequence)
                 continue
             if message_type in {"done", "end", "final", "eos", "eof", "end_of_stream"}:
                 logger.info("TTS eos")
                 break
+            if isinstance(data_dict, dict) and (
+                data_dict.get("final")
+                or data_dict.get("is_final")
+                or data_dict.get("done")
+            ):
+                logger.info("TTS eos (final)")
+                break
             if message_type == "error":
-                raise RuntimeError(data.get("message") or "TTS error")
+                raise RuntimeError(data_dict.get("message") or "TTS error")
+        publish_event(
+            game_id,
+            "tts-end",
+            {"role": role, "text": text, "utterance_id": utterance_id},
+        )
+        logger.info(
+            "TTS end published | game_id=%s utterance_id=%s role=%s",
+            game_id,
+            utterance_id,
+            role,
+        )
+        return True
 
 
 def start_game_internal(
