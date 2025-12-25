@@ -326,7 +326,6 @@ class GradiumTTSManager:
         self.api_key = api_key
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
-        self._ws: websockets.WebSocketClientProtocol | None = None
         self._last_tts_sent_at = 0.0
 
     async def speak(self, game_id: str, role: str, text: str) -> None:
@@ -391,18 +390,10 @@ class GradiumTTSManager:
             },
         )
         logger.info("TTS connecting")
+        ws: websockets.WebSocketClientProtocol | None = None
         try:
             ws = await self._ensure_connection()
-            await ws.send(
-                json.dumps(
-                    {
-                        "type": "setup",
-                        "model_name": "default",
-                        "voice_id": voice_id,
-                        "output_format": "pcm_24000",
-                    }
-                )
-            )
+            await self._send_setup_and_wait_ready(ws, voice_id)
             await ws.send(json.dumps({"type": "text", "text": text, "flush": True}))
             await self._stream_audio(ws, game_id, role, text, utterance_id)
         except Exception as exc:
@@ -413,8 +404,9 @@ class GradiumTTSManager:
                 role,
                 exc,
             )
-            await self._reset_connection()
+            await self._reset_connection(ws)
         finally:
+            await self._reset_connection(ws)
             publish_event(
                 game_id,
                 "tts-end",
@@ -428,25 +420,46 @@ class GradiumTTSManager:
             )
 
     async def _ensure_connection(self) -> websockets.WebSocketClientProtocol:
-        if self._ws and not self._ws.closed:
-            return self._ws
-        if self._ws:
-            await self._ws.close()
-        self._ws = await websockets.connect(
+        return await websockets.connect(
             "wss://eu.api.gradium.ai/api/speech/tts",
             additional_headers={"x-api-key": self.api_key},
             max_size=None,
         )
-        return self._ws
 
-    async def _reset_connection(self) -> None:
-        if not self._ws:
+    async def _reset_connection(
+        self, ws: websockets.WebSocketClientProtocol | None
+    ) -> None:
+        if not ws:
             return
         try:
-            await self._ws.close()
+            await ws.close()
+            logger.info("TTS connection closed")
         except Exception:
             pass
-        self._ws = None
+
+    async def _send_setup_and_wait_ready(
+        self, ws: websockets.WebSocketClientProtocol, voice_id: str
+    ) -> None:
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "setup",
+                    "model_name": "default",
+                    "voice_id": voice_id,
+                    "output_format": "wav",
+                }
+            )
+        )
+        logger.info("TTS setup sent")
+        while True:
+            message = await ws.recv()
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and str(data.get("type", "")).lower() == "ready":
+                logger.info("TTS ready")
+                return
 
     async def _stream_audio(
         self,
@@ -465,7 +478,7 @@ class GradiumTTSManager:
                 websockets.exceptions.ConnectionClosed,
                 websockets.exceptions.ConnectionClosedError,
             ) as exc:
-                logger.warning("TTS connection closed | reason=%s", exc)
+                logger.info("TTS connection closed | reason=%s", exc)
                 break
             try:
                 data = json.loads(message)
@@ -481,7 +494,7 @@ class GradiumTTSManager:
                 continue
             message_type = str(message_type).lower()
             if message_type == "audio":
-                raw = data.get("audio")
+                raw = data.get("audio") or data.get("data")
                 if not raw:
                     continue
                 try:
@@ -493,6 +506,7 @@ class GradiumTTSManager:
                         exc,
                     )
                 else:
+                    encoded = base64.b64encode(decoded).decode("ascii")
                     total_bytes += len(decoded)
                     publish_event(
                         game_id,
@@ -502,7 +516,7 @@ class GradiumTTSManager:
                             "text": text,
                             "utterance_id": utterance_id,
                             "sequence": sequence,
-                            "chunk": raw,
+                            "chunk": encoded,
                         },
                     )
                     logger.info("TTS audio chunk | sequence=%s", sequence)
