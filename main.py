@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
 import json
 import logging
 import os
@@ -84,6 +82,9 @@ def demo_root():
       const ttsFeedbackEl = document.getElementById("tts-feedback");
       let audioContext = null;
       let currentUtteranceId = null;
+      let playbackQueue = Promise.resolve();
+      let nextPlaybackTime = 0;
+      let currentSampleRate = 24000;
 
       function ensureAudioContext() {
         if (!audioContext) {
@@ -114,15 +115,39 @@ def demo_root():
         return bytes.buffer;
       }
 
-      function playWav(base64Audio) {
+      function decodeBase64ToInt16(base64Audio) {
+        const buffer = decodeBase64ToArrayBuffer(base64Audio);
+        return new Int16Array(buffer);
+      }
+
+      function pcmToAudioBuffer(pcmData, sampleRate) {
         ensureAudioContext();
-        const wavBuffer = decodeBase64ToArrayBuffer(base64Audio);
-        return audioContext.decodeAudioData(wavBuffer).then((decoded) => {
-          const source = audioContext.createBufferSource();
-          source.buffer = decoded;
-          source.connect(audioContext.destination);
-          source.start();
+        const audioBuffer = audioContext.createBuffer(1, pcmData.length, sampleRate);
+        const channel = audioBuffer.getChannelData(0);
+        for (let i = 0; i < pcmData.length; i += 1) {
+          channel[i] = pcmData[i] / 32768;
+        }
+        return audioBuffer;
+      }
+
+      function schedulePlayback(audioBuffer) {
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        const now = audioContext.currentTime;
+        const startAt = Math.max(now, nextPlaybackTime || now);
+        source.start(startAt);
+        nextPlaybackTime = startAt + audioBuffer.duration;
+        return new Promise((resolve) => {
+          source.onended = resolve;
         });
+      }
+
+      function playPcmChunk(base64Audio, sampleRate) {
+        const pcmData = decodeBase64ToInt16(base64Audio);
+        const audioBuffer = pcmToAudioBuffer(pcmData, sampleRate);
+        playbackQueue = playbackQueue.then(() => schedulePlayback(audioBuffer));
+        return playbackQueue;
       }
 
       async function startDemo() {
@@ -150,6 +175,9 @@ def demo_root():
           try {
             const payload = JSON.parse(event.data);
             utteranceId = payload && payload.utterance_id;
+            if (payload && payload.sample_rate) {
+              currentSampleRate = payload.sample_rate;
+            }
           } catch (error) {
             utteranceId = null;
           }
@@ -157,14 +185,19 @@ def demo_root():
             return;
           }
           currentUtteranceId = utteranceId;
+          playbackQueue = Promise.resolve();
+          nextPlaybackTime = audioContext ? audioContext.currentTime : 0;
           showThinking();
         });
         eventSource.addEventListener("tts-audio", (event) => {
           try {
             const payload = JSON.parse(event.data);
             if (payload && payload.audio && payload.utterance_id != null) {
-              playWav(payload.audio).catch((error) => {
-                console.log("decodeAudioData failed", error);
+              if (payload.utterance_id !== currentUtteranceId) {
+                return;
+              }
+              playPcmChunk(payload.audio, currentSampleRate).catch((error) => {
+                console.log("PCM playback failed", error);
               });
             }
           } catch (error) {
@@ -223,6 +256,10 @@ class GradiumTTSManager:
         self._queue: asyncio.Queue[dict] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
         self._last_tts_sent_at = 0.0
+        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._setup_complete = False
+        self._voice_id: str | None = None
+        self._connection_failed = False
 
     async def speak(self, game_id: str, role: str, text: str) -> None:
         if role not in {"PLAYER_MOVE", "AI_MOVE"}:
@@ -300,9 +337,8 @@ class GradiumTTSManager:
                 role,
                 exc,
             )
-            await self._reset_connection(ws)
+            await self._reset_connection(ws, mark_failed=True)
         finally:
-            await self._reset_connection(ws)
             publish_event(
                 game_id,
                 "tts-end",
@@ -316,14 +352,24 @@ class GradiumTTSManager:
             )
 
     async def _ensure_connection(self) -> websockets.WebSocketClientProtocol:
-        return await websockets.connect(
+        if self._connection_failed:
+            raise RuntimeError("TTS connection is unavailable")
+        if self._ws and self._ws.closed:
+            self._connection_failed = True
+            raise RuntimeError("TTS connection already closed")
+        if self._ws:
+            return self._ws
+        self._ws = await websockets.connect(
             "wss://eu.api.gradium.ai/api/speech/tts",
             additional_headers={"x-api-key": self.api_key},
             max_size=None,
         )
+        return self._ws
 
     async def _reset_connection(
-        self, ws: websockets.WebSocketClientProtocol | None
+        self,
+        ws: websockets.WebSocketClientProtocol | None,
+        mark_failed: bool = False,
     ) -> None:
         if not ws:
             return
@@ -332,17 +378,34 @@ class GradiumTTSManager:
             logger.info("TTS connection closed")
         except Exception:
             pass
+        finally:
+            if ws is self._ws:
+                self._ws = None
+        if mark_failed:
+            self._connection_failed = True
 
     async def _send_setup_and_wait_ready(
         self, ws: websockets.WebSocketClientProtocol, voice_id: str
     ) -> None:
+        if self._setup_complete:
+            return
+        if self._voice_id and self._voice_id != voice_id:
+            logger.info(
+                "TTS voice locked | requested=%s using=%s",
+                voice_id,
+                self._voice_id,
+            )
+        if not self._voice_id:
+            self._voice_id = voice_id
         await ws.send(
             json.dumps(
                 {
                     "type": "setup",
                     "model_name": "default",
-                    "voice_id": voice_id,
-                    "output_format": "wav",
+                    "voice_id": self._voice_id,
+                    "output_format": "pcm",
+                    "sample_rate": 24000,
+                    "channels": 1,
                 }
             )
         )
@@ -355,6 +418,7 @@ class GradiumTTSManager:
                 continue
             if isinstance(data, dict) and str(data.get("type", "")).lower() == "ready":
                 logger.info("TTS ready")
+                self._setup_complete = True
                 return
 
     async def _stream_audio(
@@ -365,7 +429,6 @@ class GradiumTTSManager:
         text: str,
         utterance_id: str,
     ) -> None:
-        wav_bytes = bytearray()
         while True:
             try:
                 message = await ws.recv()
@@ -393,37 +456,24 @@ class GradiumTTSManager:
             message_type = str(message_type).lower()
             if message_type == "audio":
                 raw = data.get("audio") or data.get("data")
-                if not raw:
+                if not raw or not isinstance(raw, str):
                     continue
-                try:
-                    decoded = base64.b64decode(raw)
-                except (binascii.Error, TypeError) as exc:
-                    logger.warning(
-                        "TTS audio chunk decode failed | error=%s",
-                        exc,
-                    )
-                else:
-                    wav_bytes.extend(decoded)
+                publish_event(
+                    game_id,
+                    "tts-audio",
+                    {
+                        "role": role,
+                        "utterance_id": utterance_id,
+                        "audio": raw,
+                    },
+                )
+                logger.info("TTS publish pcm chunk size=%s", len(raw))
                 continue
             if message_type in {"done", "end", "final", "eos", "eof", "end_of_stream"}:
                 logger.info("TTS eos")
                 break
             if message_type == "error":
                 raise RuntimeError(data.get("message") or "TTS error")
-        if not wav_bytes:
-            logger.info("TTS publish wav bytes=0")
-            return
-        encoded = base64.b64encode(bytes(wav_bytes)).decode("ascii")
-        publish_event(
-            game_id,
-            "tts-audio",
-            {
-                "role": role,
-                "utterance_id": utterance_id,
-                "audio": encoded,
-            },
-        )
-        logger.info("TTS publish wav bytes=%s", len(wav_bytes))
 
 
 def start_game_internal(
@@ -1099,6 +1149,9 @@ def demo():
 
       let audioContext = null;
       let currentUtteranceId = null;
+      let playbackQueue = Promise.resolve();
+      let nextPlaybackTime = 0;
+      let currentSampleRate = 24000;
 
       function ensureAudioContext() {
         if (!audioContext) {
@@ -1118,6 +1171,11 @@ def demo():
         return bytes.buffer;
       }
 
+      function decodeBase64ToInt16(base64Audio) {
+        const buffer = decodeBase64ToArrayBuffer(base64Audio);
+        return new Int16Array(buffer);
+      }
+
       function log(message) {
         const line = `[${new Date().toLocaleTimeString()}] ${message}\\n`;
         logEl.textContent = line + logEl.textContent;
@@ -1133,15 +1191,34 @@ def demo():
         ttsStatusEl.classList.remove("connected");
       }
 
-      function playWav(base64Audio) {
+      function pcmToAudioBuffer(pcmData, sampleRate) {
         ensureAudioContext();
-        const wavBuffer = decodeBase64ToArrayBuffer(base64Audio);
-        return audioContext.decodeAudioData(wavBuffer).then((decoded) => {
-          const source = audioContext.createBufferSource();
-          source.buffer = decoded;
-          source.connect(audioContext.destination);
-          source.start();
+        const audioBuffer = audioContext.createBuffer(1, pcmData.length, sampleRate);
+        const channel = audioBuffer.getChannelData(0);
+        for (let i = 0; i < pcmData.length; i += 1) {
+          channel[i] = pcmData[i] / 32768;
+        }
+        return audioBuffer;
+      }
+
+      function schedulePlayback(audioBuffer) {
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+        const now = audioContext.currentTime;
+        const startAt = Math.max(now, nextPlaybackTime || now);
+        source.start(startAt);
+        nextPlaybackTime = startAt + audioBuffer.duration;
+        return new Promise((resolve) => {
+          source.onended = resolve;
         });
+      }
+
+      function playPcmChunk(base64Audio, sampleRate) {
+        const pcmData = decodeBase64ToInt16(base64Audio);
+        const audioBuffer = pcmToAudioBuffer(pcmData, sampleRate);
+        playbackQueue = playbackQueue.then(() => schedulePlayback(audioBuffer));
+        return playbackQueue;
       }
 
       function handleCommentary(payload) {
@@ -1172,6 +1249,9 @@ def demo():
           try {
             const payload = JSON.parse(event.data);
             utteranceId = payload && payload.utterance_id;
+            if (payload && payload.sample_rate) {
+              currentSampleRate = payload.sample_rate;
+            }
           } catch (error) {
             utteranceId = null;
           }
@@ -1179,14 +1259,19 @@ def demo():
             return;
           }
           currentUtteranceId = utteranceId;
+          playbackQueue = Promise.resolve();
+          nextPlaybackTime = audioContext ? audioContext.currentTime : 0;
           showThinking();
         });
         eventSource.addEventListener("tts-audio", (event) => {
           try {
             const payload = JSON.parse(event.data);
             if (payload && payload.audio && payload.utterance_id != null) {
-              playWav(payload.audio).catch((error) => {
-                console.log("decodeAudioData failed", error);
+              if (payload.utterance_id !== currentUtteranceId) {
+                return;
+              }
+              playPcmChunk(payload.audio, currentSampleRate).catch((error) => {
+                console.log("PCM playback failed", error);
               });
             }
           } catch (error) {
