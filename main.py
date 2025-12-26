@@ -90,8 +90,6 @@ def demo_root():
       let playbackQueue = Promise.resolve();
       let nextPlaybackTime = 0;
       let currentSampleRate = 24000;
-      const safetyGapSeconds = 0.005;
-      const rampDurationSeconds = 0.004;
 
       function ensureAudioContext() {
         if (!audioContext) {
@@ -131,21 +129,8 @@ def demo_root():
         ensureAudioContext();
         const audioBuffer = audioContext.createBuffer(1, pcmData.length, sampleRate);
         const channel = audioBuffer.getChannelData(0);
-        const rampSamples = Math.min(
-          Math.floor(sampleRate * rampDurationSeconds),
-          Math.floor(pcmData.length / 2),
-        );
-        const totalSamples = pcmData.length;
         for (let i = 0; i < pcmData.length; i += 1) {
-          let value = pcmData[i] / 32768;
-          if (rampSamples > 0) {
-            if (i < rampSamples) {
-              value *= i / rampSamples;
-            } else if (i >= totalSamples - rampSamples) {
-              value *= (totalSamples - i - 1) / rampSamples;
-            }
-          }
-          channel[i] = value;
+          channel[i] = pcmData[i] / 32768;
         }
         return audioBuffer;
       }
@@ -155,15 +140,11 @@ def demo_root():
         source.buffer = audioBuffer;
         source.connect(audioContext.destination);
         const now = audioContext.currentTime;
-        if (!Number.isFinite(nextPlaybackTime)) {
+        if (!Number.isFinite(nextPlaybackTime) || nextPlaybackTime < now) {
           nextPlaybackTime = now;
         }
-        if (nextPlaybackTime < now) {
-          nextPlaybackTime = now;
-        }
-        const startAt = Math.max(now, nextPlaybackTime);
-        source.start(startAt);
-        nextPlaybackTime = startAt + audioBuffer.duration + safetyGapSeconds;
+        source.start(nextPlaybackTime);
+        nextPlaybackTime += audioBuffer.duration;
         return new Promise((resolve) => {
           source.onended = resolve;
         });
@@ -216,7 +197,7 @@ def demo_root():
           drainingUtteranceId = null;
           drainPromise = null;
           playbackQueue = Promise.resolve();
-          nextPlaybackTime = audioContext ? audioContext.currentTime : 0;
+          nextPlaybackTime = audioContext ? audioContext.currentTime + 0.05 : 0;
           showThinking();
         });
         eventSource.addEventListener("tts-audio", (event) => {
