@@ -533,60 +533,11 @@ class GradiumTTSManager:
         utterance_id: str,
     ) -> bool:
         sequence = 0
-        while True:
-            try:
-                message = await ws.recv()
-            except (
-                websockets.exceptions.ConnectionClosed,
-                websockets.exceptions.ConnectionClosedError,
-            ) as exc:
-                close_code = getattr(exc, "code", None)
-                if close_code == 1000:
-                    logger.info("TTS connection closed (normal) | reason=%s", exc)
-                else:
-                    logger.info("TTS connection closed | reason=%s", exc)
-                break
-            if isinstance(message, (bytes, bytearray)):
-                sequence += 1
-                encoded_audio = base64.b64encode(message).decode("ascii")
-                publish_event(
-                    game_id,
-                    "tts-audio",
-                    {
-                        "role": role,
-                        "utterance_id": utterance_id,
-                        "sequence": sequence,
-                        "chunk": encoded_audio,
-                        "audio": encoded_audio,
-                    },
-                )
-                logger.info(
-                    "TTS received audio bytes size=%s seq=%s", len(message), sequence
-                )
-                continue
-
-            try:
-                data = json.loads(message)
-            except json.JSONDecodeError:
-                data = message
-            if isinstance(data, str):
-                message_type = data
-                data_dict = {}
-            elif isinstance(data, dict):
-                message_type = data.get("type")
-                data_dict = data
-            else:
-                continue
-            if message_type is None:
-                continue
-            message_type = str(message_type).lower()
-            data_dict = data_dict if isinstance(data_dict, dict) else {}
-            raw = data_dict.get("audio")
-            if message_type == "audio" and raw is not None:
-                if isinstance(raw, (bytes, bytearray)):
-                    raw = base64.b64encode(raw).decode("ascii")
-                if isinstance(raw, str):
+        try:
+            async for message in ws:
+                if isinstance(message, (bytes, bytearray)):
                     sequence += 1
+                    encoded_audio = base64.b64encode(message).decode("ascii")
                     publish_event(
                         game_id,
                         "tts-audio",
@@ -594,26 +545,67 @@ class GradiumTTSManager:
                             "role": role,
                             "utterance_id": utterance_id,
                             "sequence": sequence,
-                            "chunk": raw,
-                            "audio": raw,
+                            "chunk": encoded_audio,
+                            "audio": encoded_audio,
                         },
                     )
                     logger.info(
-                        "TTS publish pcm chunk size=%s seq=%s", len(raw), sequence
+                        "TTS received audio bytes size=%s seq=%s",
+                        len(message),
+                        sequence,
                     )
                     continue
-            end_markers = {"done", "end", "final", "eos", "eof", "end_of_stream"}
-            if message_type in end_markers:
-                logger.info("TTS received eos type=%s", message_type)
-                break
-            if any(
-                data_dict.get(flag) is True
-                for flag in ("final", "is_final", "done")
-            ):
-                logger.info("TTS received eos flag")
-                break
-            if message_type == "error":
-                raise RuntimeError(data_dict.get("message") or "TTS error")
+
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
+                    data = message
+                if isinstance(data, str):
+                    message_type = data
+                    data_dict = {}
+                elif isinstance(data, dict):
+                    message_type = data.get("type")
+                    data_dict = data
+                else:
+                    continue
+                if message_type is None:
+                    continue
+                message_type = str(message_type).lower()
+                data_dict = data_dict if isinstance(data_dict, dict) else {}
+                raw = data_dict.get("audio")
+                if message_type == "audio" and raw is not None:
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw = base64.b64encode(raw).decode("ascii")
+                    if isinstance(raw, str):
+                        sequence += 1
+                        publish_event(
+                            game_id,
+                            "tts-audio",
+                            {
+                                "role": role,
+                                "utterance_id": utterance_id,
+                                "sequence": sequence,
+                                "chunk": raw,
+                                "audio": raw,
+                            },
+                        )
+                        logger.info(
+                            "TTS publish pcm chunk size=%s seq=%s",
+                            len(raw),
+                            sequence,
+                        )
+                        continue
+                if message_type == "error":
+                    raise RuntimeError(data_dict.get("message") or "TTS error")
+        except (
+            websockets.exceptions.ConnectionClosed,
+            websockets.exceptions.ConnectionClosedError,
+        ) as exc:
+            close_code = getattr(exc, "code", None)
+            if close_code == 1000:
+                logger.info("TTS connection closed (normal) | reason=%s", exc)
+            else:
+                logger.info("TTS connection closed | reason=%s", exc)
         publish_event(
             game_id,
             "tts-end",
