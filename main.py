@@ -369,25 +369,13 @@ class GradiumTTSManager:
             )
             tts_start_sent = True
             await ws.send(json.dumps({"type": "text", "text": text}))
-            try:
-                tts_end_sent = await asyncio.wait_for(
-                    self._stream_audio(ws, game_id, role, text, utterance_id),
-                    timeout=20,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "TTS stream timeout | game_id=%s utterance_id=%s role=%s",
-                    game_id,
-                    utterance_id,
-                    role,
-                )
-                publish_event(
-                    game_id,
-                    "tts-end",
-                    {"role": role, "text": text, "utterance_id": utterance_id},
-                )
-                tts_end_sent = True
-                await self._reset_connection(ws, mark_failed=False)
+            tts_end_sent = await self._stream_audio(
+                ws,
+                game_id,
+                role,
+                text,
+                utterance_id,
+            )
         except Exception as exc:
             logger.warning(
                 "TTS speak failed | game_id=%s utterance_id=%s role=%s error=%s",
