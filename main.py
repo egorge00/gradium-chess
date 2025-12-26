@@ -77,9 +77,11 @@ def demo_root():
   </head>
   <body>
     <button id="start-demo">Démarrer la démo</button>
+    <button id="tts-test" style="margin-left: 12px;">🔊 Tester la voix (debug)</button>
     <div id="tts-feedback" style="margin-top: 12px; color: #4b5563;"></div>
     <script>
       const button = document.getElementById("start-demo");
+      const ttsTestButton = document.getElementById("tts-test");
       const ttsFeedbackEl = document.getElementById("tts-feedback");
       let audioContext = null;
       let currentUtteranceId = null;
@@ -154,6 +156,7 @@ def demo_root():
       async function startDemo() {
         const response = await fetch("/start-game-demo");
         const data = await response.json();
+        window.currentGameId = data.game_id;
         if (data.game_url) {
           window.open(data.game_url, "_blank", "noopener,noreferrer");
         }
@@ -227,6 +230,19 @@ def demo_root():
       button.addEventListener("click", async () => {
         ensureAudioContext();
         startDemo();
+      });
+
+      ttsTestButton.addEventListener("click", async () => {
+        if (!window.currentGameId) {
+          alert("Lance d'abord une partie");
+          return;
+        }
+
+        await fetch("/debug/tts-inject", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ game_id: window.currentGameId }),
+        });
       });
     </script>
   </body>
