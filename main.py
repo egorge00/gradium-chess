@@ -837,6 +837,32 @@ def debug_gradium_test():
     return Response(content=response.content, media_type="application/octet-stream")
 
 
+@app.post("/debug/tts-inject")
+async def debug_tts_inject(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    game_id = body.get("game_id") if isinstance(body, dict) else None
+    if not game_id:
+        raise HTTPException(status_code=400, detail="game_id missing")
+
+    manager = ensure_tts_manager()
+    if not manager:
+        raise HTTPException(status_code=500, detail="TTS manager not available")
+
+    if not APP_LOOP:
+        raise HTTPException(status_code=500, detail="App loop not ready")
+
+    text = "Salut, je suis le coach. Ceci est un test audio force."
+
+    asyncio.run_coroutine_threadsafe(
+        manager.speak(game_id, "PLAYER_MOVE", text),
+        APP_LOOP,
+    )
+
+    return {"status": "ok"}
+
 
 
 def enqueue_commentary(game_id: str, move_uci: str, role: str) -> None:
@@ -1181,6 +1207,20 @@ def demo():
         max-height: 200px;
         overflow: auto;
       }
+      .debug-button {
+        margin-top: 12px;
+        padding: 10px 16px;
+        border-radius: 8px;
+        border: none;
+        background: #2563eb;
+        color: white;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .debug-button:disabled {
+        cursor: not-allowed;
+        opacity: 0.6;
+      }
     </style>
   </head>
   <body>
@@ -1192,6 +1232,7 @@ def demo():
         SSE: <span id="sse-status" class="status">connecting…</span>
         TTS: <span id="tts-status" class="status">idle</span>
       </div>
+      <button id="tts-test" class="debug-button">🔊 Tester la voix (debug)</button>
     </div>
 
     <div class="card">
@@ -1205,6 +1246,7 @@ def demo():
       const gameUrlEl = document.getElementById("game-url");
       const sseStatusEl = document.getElementById("sse-status");
       const ttsStatusEl = document.getElementById("tts-status");
+      const ttsTestButton = document.getElementById("tts-test");
 
       let audioContext = null;
       let currentUtteranceId = null;
@@ -1363,6 +1405,24 @@ def demo():
           sseStatusEl.classList.remove("connected");
         });
       }
+
+      ttsTestButton.addEventListener("click", async () => {
+        const gameId = gameIdEl.textContent;
+        if (!gameId || gameId === "—") {
+          alert("Game ID non disponible");
+          return;
+        }
+        ttsTestButton.disabled = true;
+        try {
+          await fetch("/debug/tts-inject", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ game_id: gameId }),
+          });
+        } finally {
+          ttsTestButton.disabled = false;
+        }
+      });
 
       startDemo();
 
