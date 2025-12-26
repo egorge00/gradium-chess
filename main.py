@@ -78,10 +78,12 @@ def demo_root():
   <body>
     <button id="start-demo">Démarrer la démo</button>
     <button id="tts-test" style="margin-left: 12px;">🔊 Tester la voix (debug)</button>
+    <button id="tts-http-test" style="margin-left: 12px;">🔊 Tester la voix Gradium</button>
     <div id="tts-feedback" style="margin-top: 12px; color: #4b5563;"></div>
     <script>
       const button = document.getElementById("start-demo");
       const ttsTestButton = document.getElementById("tts-test");
+      const ttsHttpTestButton = document.getElementById("tts-http-test");
       const ttsFeedbackEl = document.getElementById("tts-feedback");
       let audioContext = null;
       let currentUtteranceId = null;
@@ -244,11 +246,59 @@ def demo_root():
           body: JSON.stringify({ game_id: window.currentGameId }),
         });
       });
+
+      ttsHttpTestButton.addEventListener("click", async () => {
+        try {
+          const response = await fetch("/debug/tts-http-test", { method: "POST" });
+          if (!response.ok) {
+            throw new Error("TTS HTTP test failed");
+          }
+          const audioBuffer = await response.arrayBuffer();
+          const audioBlob = new Blob([audioBuffer], { type: "audio/wav" });
+          const audioUrl = URL.createObjectURL(audioBlob);
+          const audio = new Audio(audioUrl);
+          audio.addEventListener("ended", () => URL.revokeObjectURL(audioUrl));
+          await audio.play();
+        } catch (error) {
+          console.log("HTTP TTS test failed", error);
+          alert("Impossible de lire le test audio.");
+        }
+      });
     </script>
   </body>
 </html>
 """
     return Response(content=html, media_type="text/html")
+
+
+@app.post("/debug/tts-http-test")
+def debug_tts_http_test():
+    api_key = os.getenv("GRADIUM_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GRADIUM_API_KEY is not set")
+    payload = {
+        "text": "Salut, ceci est un test audio Gradium en HTTP stateless.",
+        "voice_id": "b35yykvVppLXyw_l",
+        "format": "wav",
+    }
+    try:
+        response = requests.post(
+            "https://api.gradium.ai/v1/tts/synthesize",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail="Gradium TTS HTTP request failed") from exc
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gradium TTS error: {response.status_code}",
+        )
+    return Response(content=response.content, media_type="audio/wav")
 
 
 @app.get("/env-check")
