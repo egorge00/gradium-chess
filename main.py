@@ -1,3 +1,18 @@
+"""
+Gradium Chess - minimal PoC backend
+
+Objective (PoC):
+- Allow a user to open a URL and start a Lichess human vs AI game (level default 3)
+- Stream moves from Lichess, generate short one-line commentary per move,
+  and stream TTS audio in near real-time to the browser (SSE events).
+- Prioritize player move commentary (player -> AI order).
+- No user accounts. Shareable by URL.
+
+Notes:
+- Secrets (LICHESS_TOKEN, GRADIUM_API_KEY, MISTRAL_API_KEY) must remain on the backend.
+- The backend runs a small FastAPI app that serves a demo page and SSE endpoints.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -11,1213 +26,59 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections import deque
+from typing import Dict
 
 import requests
 import websockets
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response, StreamingResponse
-from google import genai
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("gradium-chess")
 
-app = FastAPI()
+app = FastAPI(title="Gradium Chess PoC")
 
-DEFAULT_VOICE_COACH_ID = "b35yykvVppLXyw_l"
-DEFAULT_VOICE_AI_ID = "axlOaUiFyOZhy4nv"
-
+# -------------------------
+# Global runtime state
+# -------------------------
+# Simple FIFO queue of (game_id, move_uci, role)
 COMMENTARY_QUEUE: deque[tuple[str, str, str]] = deque()
 COMMENTARY_LOCK = threading.Lock()
 COMMENTARY_WORKER_ACTIVE = False
-LAST_LLM_CALL_AT: float | None = None
-LAST_PROCESSED_MOVE_COUNT = 0
-EVENT_SUBSCRIBERS: dict[str, dict] = {}
+
+# Event subscribers: game_id -> {"queue": asyncio.Queue, "loop": loop, "subscribers": int}
+EVENT_SUBSCRIBERS: Dict[str, dict] = {}
 EVENT_SUBSCRIBERS_LOCK = threading.Lock()
-CURRENT_TURN = {
-    "player_move": None,
-    "ai_move": None,
-    "player_commented": False,
-    "ai_commented": False,
-}
-TTS_MANAGER: GradiumTTSManager | None = None
-TTS_MANAGER_LOCK = threading.Lock()
-GAME_CONTEXTS: dict[str, dict] = {}
+
+# Game contexts (per game)
+GAME_CONTEXTS: Dict[str, dict] = {}
 GAME_CONTEXTS_LOCK = threading.Lock()
+
+# Which event loop the FastAPI app uses (set on startup)
 APP_LOOP: asyncio.AbstractEventLoop | None = None
-TTS_THROTTLE_SECONDS = 1.0
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+# Minimal defaults
+DEFAULT_VOICE_COACH_ID = "b35yykvVppLXyw_l"  # Elise (FR) in docs
+DEFAULT_VOICE_AI_ID = "axlOaUiFyOZhy4nv"  # Leo (FR) in docs
 
+# Throttle between LLM calls (seconds)
+LLM_THROTTLE_SECONDS = 0.9
+_LAST_LLM_CALL_AT: float | None = None
 
-@app.on_event("startup")
-async def start_tts_worker():
-    global APP_LOOP
-    APP_LOOP = asyncio.get_running_loop()
+# TTS manager placeholder (lazy init)
+TTS_MANAGER: "GradiumTTSManager" | None = None
+TTS_MANAGER_LOCK = threading.Lock()
 
 
-@app.get("/")
-def demo_root():
-    html = """<!doctype html>
-<html lang="fr">
-  <head>
-    <meta charset="utf-8" />
-    <title>Gradium Chess Demo</title>
-    <style>
-      body {
-        font-family: Arial, sans-serif;
-        margin: 32px;
-      }
-      button {
-        font-size: 16px;
-        padding: 12px 18px;
-      }
-    </style>
-  </head>
-  <body>
-    <button id="start-demo">Démarrer la démo</button>
-    <button id="tts-test" style="margin-left: 12px;">🔊 Tester la voix (debug)</button>
-    <div id="tts-feedback" style="margin-top: 12px; color: #4b5563;"></div>
-    <script>
-      const button = document.getElementById("start-demo");
-      const ttsTestButton = document.getElementById("tts-test");
-      const ttsFeedbackEl = document.getElementById("tts-feedback");
-      let audioContext = null;
-      let currentUtteranceId = null;
-      let drainingUtteranceId = null;
-      let drainPromise = null;
-      let playbackQueue = Promise.resolve();
-      let nextPlaybackTime = 0;
-      let currentSampleRate = 24000;
-
-      function ensureAudioContext() {
-        if (!audioContext) {
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        }
-        if (audioContext.state === "suspended") {
-          audioContext.resume().catch(() => {});
-        }
-        if (audioContext.state !== "running") {
-          audioContext.resume().catch(() => {});
-        }
-      }
-
-      function showThinking() {
-        ttsFeedbackEl.textContent = "🎧 Le coach réfléchit…";
-      }
-
-      function clearThinking() {
-        ttsFeedbackEl.textContent = "";
-      }
-
-      function decodeBase64ToArrayBuffer(base64Audio) {
-        const binary = atob(base64Audio);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i += 1) {
-          bytes[i] = binary.charCodeAt(i);
-        }
-        return bytes.buffer;
-      }
-
-      function decodeBase64ToInt16(base64Audio) {
-        const buffer = decodeBase64ToArrayBuffer(base64Audio);
-        return new Int16Array(buffer);
-      }
-
-      function pcmToAudioBuffer(pcmData, sampleRate) {
-        ensureAudioContext();
-        const audioBuffer = audioContext.createBuffer(1, pcmData.length, sampleRate);
-        const channel = audioBuffer.getChannelData(0);
-        for (let i = 0; i < pcmData.length; i += 1) {
-          channel[i] = pcmData[i] / 32768;
-        }
-        return audioBuffer;
-      }
-
-      function schedulePlayback(audioBuffer) {
-        const source = audioContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(audioContext.destination);
-        const now = audioContext.currentTime;
-        if (!Number.isFinite(nextPlaybackTime) || nextPlaybackTime < now) {
-          nextPlaybackTime = now;
-        }
-        source.start(nextPlaybackTime);
-        nextPlaybackTime += audioBuffer.duration;
-        return new Promise((resolve) => {
-          source.onended = resolve;
-        });
-      }
-
-      function playPcmChunk(base64Audio, sampleRate) {
-        const pcmData = decodeBase64ToInt16(base64Audio);
-        const audioBuffer = pcmToAudioBuffer(pcmData, sampleRate);
-        playbackQueue = playbackQueue.then(() => schedulePlayback(audioBuffer));
-        return playbackQueue;
-      }
-
-      async function startDemo() {
-        const response = await fetch("/start-game-demo");
-        const data = await response.json();
-        window.currentGameId = data.game_id;
-        if (data.game_url) {
-          window.open(data.game_url, "_blank", "noopener,noreferrer");
-        }
-        if (!data.game_id) {
-          return;
-        }
-        const eventSource = new EventSource(`/events/${data.game_id}`);
-        eventSource.addEventListener("commentary", (event) => {
-          try {
-            const payload = JSON.parse(event.data);
-            if (payload && payload.text && payload.role) {
-              return;
-            }
-          } catch (error) {
-            return;
-          }
-        });
-        eventSource.addEventListener("tts-start", (event) => {
-          ensureAudioContext();
-          let utteranceId = null;
-          try {
-            const payload = JSON.parse(event.data);
-            utteranceId = payload && payload.utterance_id;
-            if (payload && payload.sample_rate) {
-              currentSampleRate = payload.sample_rate;
-            }
-          } catch (error) {
-            utteranceId = null;
-          }
-          if (!utteranceId) {
-            return;
-          }
-          currentUtteranceId = utteranceId;
-          drainingUtteranceId = null;
-          drainPromise = null;
-          playbackQueue = Promise.resolve();
-          nextPlaybackTime = audioContext ? audioContext.currentTime + 0.05 : 0;
-          showThinking();
-        });
-        eventSource.addEventListener("tts-audio", (event) => {
-          try {
-            const payload = JSON.parse(event.data);
-            if (payload && payload.audio && payload.utterance_id != null) {
-              if (
-                payload.utterance_id !== currentUtteranceId &&
-                payload.utterance_id !== drainingUtteranceId
-              ) {
-                return;
-              }
-              playPcmChunk(payload.audio, currentSampleRate).catch((error) => {
-                console.log("PCM playback failed", error);
-              });
-            }
-          } catch (error) {
-            return;
-          }
-        });
-        eventSource.addEventListener("tts-end", (event) => {
-          let utteranceId = null;
-          try {
-            const payload = JSON.parse(event.data);
-            utteranceId = payload && payload.utterance_id;
-          } catch (error) {
-            utteranceId = null;
-          }
-          if (!utteranceId) {
-            return;
-          }
-          console.log(`tts-end u=${utteranceId}`);
-          if (utteranceId === currentUtteranceId) {
-            drainingUtteranceId = utteranceId;
-            if (!drainPromise) {
-              drainPromise = playbackQueue.then(() => {
-                if (drainingUtteranceId === utteranceId) {
-                  if (currentUtteranceId === utteranceId) {
-                    currentUtteranceId = null;
-                  }
-                  drainingUtteranceId = null;
-                  clearThinking();
-                }
-              });
-            }
-          }
-        });
-      }
-
-      button.addEventListener("click", async () => {
-        ensureAudioContext();
-        startDemo();
-      });
-
-      ttsTestButton.addEventListener("click", async () => {
-        if (!window.currentGameId) {
-          alert("Lance d'abord une partie");
-          return;
-        }
-
-        await fetch("/debug/tts-inject", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ game_id: window.currentGameId }),
-        });
-      });
-    </script>
-  </body>
-</html>
-"""
-    return Response(content=html, media_type="text/html")
-
-@app.get("/env-check")
-def env_check():
-    ai_level_value = os.getenv("AI_LEVEL")
-    try:
-        ai_level = int(ai_level_value) if ai_level_value is not None else None
-    except ValueError:
-        ai_level = None
-
-    return {
-        "has_lichess_token": bool(os.getenv("LICHESS_TOKEN")),
-        "has_gradium_key": bool(os.getenv("GRADIUM_API_KEY")),
-        "has_openai_key": bool(os.getenv("OPENAI_API_KEY")),
-        "ai_level": ai_level,
-    }
-
-
-class GradiumTTSManager:
-    def __init__(self, api_key: str) -> None:
-        self.api_key = api_key
-        self._queue: asyncio.Queue[dict] = asyncio.Queue()
-        self._worker_task: asyncio.Task | None = None
-        self._last_tts_sent_at = 0.0
-        self._ws: websockets.WebSocketClientProtocol | None = None
-        self._setup_complete = False
-        self._voice_id: str | None = None
-        self._connection_failed = False
-        self._sample_rate = 24000
-        self._output_format = "pcm_24000"
-        # max bytes per SSE chunk (must be even number for Int16 alignment)
-        self._sse_chunk_size = 4096
-
-    async def speak(self, game_id: str, role: str, text: str) -> None:
-        if role not in {"PLAYER_MOVE", "AI_MOVE"}:
-            raise ValueError(f"Invalid role: {role}")
-        voice_id = get_voice_id_for_game(game_id, role)
-        if not voice_id:
-            raise RuntimeError("Missing voice id for TTS")
-        loop = asyncio.get_running_loop()
-        completion: asyncio.Future = loop.create_future()
-        await self._queue.put(
-            {
-                "game_id": game_id,
-                "role": role,
-                "text": text,
-                "voice_id": voice_id,
-                "completion": completion,
-            }
-        )
-        if not self._worker_task or self._worker_task.done():
-            self._worker_task = asyncio.create_task(self._run_worker())
-        await completion
-
-    async def _run_worker(self) -> None:
-        while True:
-            job = await self._queue.get()
-            completion: asyncio.Future = job["completion"]
-            try:
-                await self._throttle()
-                await self._speak_once(
-                    job["game_id"],
-                    job["role"],
-                    job["text"],
-                    job["voice_id"],
-                )
-                if not completion.done():
-                    completion.set_result(None)
-            except Exception as exc:
-                logger.warning("TTS worker error: %s", exc)
-                await self._reset_connection()
-                if not completion.done():
-                    completion.set_exception(exc)
-
-    async def _throttle(self) -> None:
-        elapsed = time.monotonic() - self._last_tts_sent_at
-        if elapsed < TTS_THROTTLE_SECONDS:
-            await asyncio.sleep(TTS_THROTTLE_SECONDS - elapsed)
-        self._last_tts_sent_at = time.monotonic()
-
-    async def _speak_once(self, game_id: str, role: str, text: str, voice_id: str) -> None:
-        utterance_id = uuid.uuid4().hex
-        tts_start_sent = False
-        tts_end_sent = False
-        logger.info("TTS connecting")
-        ws: websockets.WebSocketClientProtocol | None = None
-        try:
-            ws = await self._ensure_connection()
-            await self._send_setup_and_wait_ready(ws, voice_id)
-            publish_event(
-                game_id,
-                "tts-start",
-                {
-                    "role": role,
-                    "text": text,
-                    "utterance_id": utterance_id,
-                    "sample_rate": self._sample_rate,
-                    "channels": 1,
-                    "sample_format": "pcm_s16le",
-                },
-            )
-            tts_start_sent = True
-            await ws.send(json.dumps({"type": "text", "text": text}))
-            tts_end_sent = await self._stream_audio(
-                ws,
-                game_id,
-                role,
-                text,
-                utterance_id,
-            )
-        except Exception as exc:
-            logger.warning(
-                "TTS speak failed | game_id=%s utterance_id=%s role=%s error=%s",
-                game_id,
-                utterance_id,
-                role,
-                exc,
-            )
-            mark_failed = False
-            close_code = getattr(exc, "code", None)
-            if close_code == 1008:
-                logger.error("TTS auth failed (1008). Check x-api-key configuration.")
-                mark_failed = True
-            await self._reset_connection(ws, mark_failed=mark_failed)
-        finally:
-            if tts_start_sent and not tts_end_sent:
-                publish_event(
-                    game_id,
-                    "tts-end",
-                    {"role": role, "text": text, "utterance_id": utterance_id},
-                )
-                logger.info(
-                    "TTS end published | game_id=%s utterance_id=%s role=%s",
-                    game_id,
-                    utterance_id,
-                    role,
-                )
-
-    async def _ensure_connection(self) -> websockets.WebSocketClientProtocol:
-        if self._connection_failed:
-            raise RuntimeError("TTS connection is unavailable")
-        if self._ws and self._ws.closed:
-            if getattr(self._ws, "close_code", None) == 1000:
-                logger.info("TTS connection closed normally; reconnecting")
-                await self._reset_connection(self._ws)
-            else:
-                close_code = getattr(self._ws, "close_code", None)
-                if close_code == 1008:
-                    logger.error("TTS auth failed (1008). Check x-api-key configuration.")
-                    await self._reset_connection(self._ws, mark_failed=True)
-                    raise RuntimeError("TTS authentication failed")
-                await self._reset_connection(self._ws)
-        if self._ws:
-            return self._ws
-        headers = [("x-api-key", self.api_key)]
-        try:
-            self._ws = await websockets.connect(
-                "wss://eu.api.gradium.ai/api/speech/tts",
-                additional_headers=headers,
-                max_size=None,
-            )
-        except TypeError:
-            self._ws = await websockets.connect(
-                "wss://eu.api.gradium.ai/api/speech/tts",
-                extra_headers=headers,
-                max_size=None,
-            )
-        return self._ws
-
-    async def _reset_connection(
-        self,
-        ws: websockets.WebSocketClientProtocol | None,
-        mark_failed: bool = False,
-    ) -> None:
-        if not ws:
-            return
-        try:
-            await ws.close()
-            logger.info("TTS connection closed")
-        except Exception:
-            pass
-        finally:
-            if ws is self._ws:
-                self._ws = None
-                self._setup_complete = False
-                self._voice_id = None
-        if mark_failed:
-            self._connection_failed = True
-
-    async def _send_setup_and_wait_ready(
-        self, ws: websockets.WebSocketClientProtocol, voice_id: str
-    ) -> None:
-        if self._setup_complete:
-            return
-        self._sample_rate = 24000
-        self._output_format = "pcm_24000"
-        await self._send_setup_payload(
-            ws,
-            voice_id,
-            {"type": "setup", "model_name": "default", "voice_id": voice_id, "output_format": "pcm_24000"},
-        )
-        logger.info("TTS setup sent | voice_id=%s", self._voice_id)
-        data = await self._wait_ready(ws)
-        if isinstance(data, dict) and str(data.get("type", "")).lower() == "error":
-            message = str(data.get("message") or "TTS setup error")
-            if "output_format" in message or "pcm_24000" in message:
-                logger.info("TTS setup fallback to pcm 48kHz")
-                self._sample_rate = 48000
-                self._output_format = "pcm"
-                await self._send_setup_payload(
-                    ws,
-                    voice_id,
-                    {
-                        "type": "setup",
-                        "model_name": "default",
-                        "voice_id": voice_id,
-                        "output_format": "pcm",
-                        "sample_rate": 48000,
-                    },
-                )
-                data = await self._wait_ready(ws)
-            else:
-                raise RuntimeError(message)
-        if isinstance(data, dict) and str(data.get("type", "")).lower() == "ready":
-            logger.info("TTS ready")
-            self._setup_complete = True
-            return
-        if isinstance(data, dict) and str(data.get("type", "")).lower() == "error":
-            raise RuntimeError(data.get("message") or "TTS setup error")
-        self._setup_complete = True
-
-    async def _send_setup_payload(
-        self,
-        ws: websockets.WebSocketClientProtocol,
-        voice_id: str,
-        payload: dict,
-    ) -> None:
-        if self._voice_id and self._voice_id != voice_id:
-            logger.info(
-                "TTS voice locked | requested=%s using=%s",
-                voice_id,
-                self._voice_id,
-            )
-        if not self._voice_id:
-            self._voice_id = voice_id
-        await ws.send(json.dumps(payload))
-
-    async def _wait_ready(self, ws: websockets.WebSocketClientProtocol) -> dict | None:
-        try:
-            message = await asyncio.wait_for(ws.recv(), timeout=5)
-        except asyncio.TimeoutError:
-            logger.info("TTS setup ready not received; continuing")
-            return None
-        try:
-            return json.loads(message)
-        except json.JSONDecodeError:
-            return None
-
-    async def _stream_audio(
-        self,
-        ws: websockets.WebSocketClientProtocol,
-        game_id: str,
-        role: str,
-        text: str,
-        utterance_id: str,
-    ) -> bool:
-        sequence = 0
-        try:
-            async for message in ws:
-                if isinstance(message, (bytes, bytearray)):
-                    # Split large binary payloads into smaller SSE-friendly chunks.
-                    # Ensure chunk byte length is even so Int16 framing remains aligned on the client.
-                    raw = bytes(message)
-                    chunk_size = self._sse_chunk_size
-                    if chunk_size % 2 != 0:
-                        chunk_size -= 1
-                    total_len = len(raw)
-                    offset = 0
-                    while offset < total_len:
-                        piece = raw[offset : offset + chunk_size]
-                        if not piece:
-                            break
-                        offset += len(piece)
-                        sequence += 1
-                        encoded_audio = base64.b64encode(piece).decode("ascii")
-                        publish_event(
-                            game_id,
-                            "tts-audio",
-                            {
-                                "role": role,
-                                "utterance_id": utterance_id,
-                                "sequence": sequence,
-                                "chunk": encoded_audio,
-                                "audio": encoded_audio,
-                            },
-                        )
-                        logger.info(
-                            "TTS received audio piece size=%s total_offset=%s seq=%s",
-                            len(piece),
-                            offset,
-                            sequence,
-                        )
-                    continue
-
-                try:
-                    data = json.loads(message)
-                except json.JSONDecodeError:
-                    data = message
-                if isinstance(data, str):
-                    message_type = data
-                    data_dict = {}
-                elif isinstance(data, dict):
-                    message_type = data.get("type")
-                    data_dict = data
-                else:
-                    continue
-                if message_type is None:
-                    continue
-                message_type = str(message_type).lower()
-                data_dict = data_dict if isinstance(data_dict, dict) else {}
-                raw = data_dict.get("audio")
-                if message_type == "audio" and raw is not None:
-                    if isinstance(raw, (bytes, bytearray)):
-                        raw = base64.b64encode(raw).decode("ascii")
-                    if isinstance(raw, str):
-                        sequence += 1
-                        publish_event(
-                            game_id,
-                            "tts-audio",
-                            {
-                                "role": role,
-                                "utterance_id": utterance_id,
-                                "sequence": sequence,
-                                "chunk": raw,
-                                "audio": raw,
-                            },
-                        )
-                        logger.info(
-                            "TTS publish pcm chunk size=%s seq=%s",
-                            len(raw),
-                            sequence,
-                        )
-                        continue
-                if message_type == "error":
-                    raise RuntimeError(data_dict.get("message") or "TTS error")
-        except (
-            websockets.exceptions.ConnectionClosed,
-            websockets.exceptions.ConnectionClosedError,
-        ) as exc:
-            close_code = getattr(exc, "code", None)
-            if close_code == 1000:
-                logger.info("TTS connection closed (normal) | reason=%s", exc)
-            else:
-                logger.info("TTS connection closed | reason=%s", exc)
-        publish_event(
-            game_id,
-            "tts-end",
-            {"role": role, "text": text, "utterance_id": utterance_id},
-        )
-        logger.info(
-            "TTS end published | game_id=%s utterance_id=%s role=%s",
-            game_id,
-            utterance_id,
-            role,
-        )
-        return True
-
-
-def start_game_internal(
-    background_tasks: BackgroundTasks,
-    voice_coach_id: str,
-    voice_ai_id: str,
-) -> dict:
-    lichess_token = os.getenv("LICHESS_TOKEN")
-    if not lichess_token:
-        raise HTTPException(status_code=500, detail="LICHESS_TOKEN not set")
-
-    ai_level_value = os.getenv("AI_LEVEL", "3")
-    try:
-        ai_level = int(ai_level_value)
-    except ValueError:
-        ai_level = 3
-
-    payload = urllib.parse.urlencode(
-        {
-            "level": ai_level,
-            "clock.limit": 600,
-            "clock.increment": 0,
-            "rated": "false",
-        }
-    ).encode("utf-8")
-
-    request = urllib.request.Request(
-        "https://lichess.org/api/challenge/ai",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {lichess_token}",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        },
-        method="POST",
-    )
-
-    with urllib.request.urlopen(request) as response:
-        data = json.loads(response.read().decode("utf-8"))
-
-    game_id = (
-        data.get("id")
-        or data.get("game", {}).get("id")
-        or data.get("challenge", {}).get("id")
-    )
-    if not game_id:
-        raise HTTPException(status_code=502, detail="Lichess response missing game id")
-
-    game_url = f"https://lichess.org/{game_id}"
-
-    game_context = {
-        "game_id": game_id,
-        "voice_coach_id": voice_coach_id,
-        "voice_ai_id": voice_ai_id,
-    }
-    with GAME_CONTEXTS_LOCK:
-        GAME_CONTEXTS[game_id] = game_context
-
-    background_tasks.add_task(stream_game_state, game_id)
-    ensure_tts_manager()
-
-    return {"game_id": game_id, "game_url": game_url}
-
-
-def ensure_tts_manager() -> GradiumTTSManager | None:
-    gradium_key = os.getenv("GRADIUM_API_KEY")
-    if not gradium_key:
-        logger.warning("GRADIUM_API_KEY not set; skipping TTS manager")
-        return None
-    with TTS_MANAGER_LOCK:
-        global TTS_MANAGER
-        if TTS_MANAGER:
-            return TTS_MANAGER
-        TTS_MANAGER = GradiumTTSManager(api_key=gradium_key)
-        logger.info("TTS manager enabled")
-
-    return TTS_MANAGER
-
-
-def shutdown_tts_manager(game_id: str) -> None:
-    with GAME_CONTEXTS_LOCK:
-        GAME_CONTEXTS.pop(game_id, None)
-    with TTS_MANAGER_LOCK:
-        global TTS_MANAGER
-        TTS_MANAGER = None
-
-
-def get_voice_id_for_game(game_id: str, role: str) -> str:
-    if role not in {"PLAYER_MOVE", "AI_MOVE"}:
-        raise ValueError(f"Invalid role: {role}")
-    with GAME_CONTEXTS_LOCK:
-        game_context = GAME_CONTEXTS.get(game_id, {})
-    voice_coach_id = game_context.get("voice_coach_id", DEFAULT_VOICE_COACH_ID)
-    voice_ai_id = game_context.get("voice_ai_id", DEFAULT_VOICE_AI_ID)
-    return voice_coach_id if role == "PLAYER_MOVE" else voice_ai_id
-
-
-@app.post("/start-game")
-def start_game(background_tasks: BackgroundTasks):
-    return start_game_internal(
-        background_tasks,
-        DEFAULT_VOICE_COACH_ID,
-        DEFAULT_VOICE_AI_ID,
-    )
-
-
-@app.get("/start-game-demo")
-def start_game_demo(background_tasks: BackgroundTasks, request: Request):
-    voice_coach_id = request.query_params.get(
-        "voice_coach",
-        DEFAULT_VOICE_COACH_ID,
-    )
-    voice_ai_id = request.query_params.get(
-        "voice_ai",
-        DEFAULT_VOICE_AI_ID,
-    )
-    return start_game_internal(
-        background_tasks,
-        voice_coach_id,
-        voice_ai_id,
-    )
-
-
-@app.get("/start-game-test")
-def start_game_test(background_tasks: BackgroundTasks):
-    return start_game_internal(
-        background_tasks,
-        DEFAULT_VOICE_COACH_ID,
-        DEFAULT_VOICE_AI_ID,
-    )
-
-
-def stream_game_state(game_id: str) -> None:
-    global LAST_PROCESSED_MOVE_COUNT
-
-    lichess_token = os.getenv("LICHESS_TOKEN")
-    if not lichess_token:
-        logger.error("LICHESS_TOKEN not set; cannot stream game")
-        return
-
-    stream_url = f"https://lichess.org/api/board/game/stream/{game_id}"
-    headers = {
-        "Authorization": f"Bearer {lichess_token}",
-        "Accept": "application/json",
-    }
-
-    human_color = None
-    LAST_PROCESSED_MOVE_COUNT = 0
-
-    try:
-        with requests.get(
-            stream_url, headers=headers, stream=True, timeout=60
-        ) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line.decode("utf-8"))
-                except json.JSONDecodeError:
-                    logger.warning("Failed to decode stream line: %s", line)
-                    continue
-                event_type = event.get("type")
-                if event_type == "gameFull":
-                    white_player = event.get("white", {})
-                    black_player = event.get("black", {})
-                    if "aiLevel" in white_player:
-                        human_color = "black"
-                    elif "aiLevel" in black_player:
-                        human_color = "white"
-                    else:
-                        human_color = None
-                    logger.info("gameFull human_color=%s", human_color)
-
-                    initial_moves = event.get("state", {}).get("moves", "")
-                    initial_moves_list = (
-                        initial_moves.split() if initial_moves else []
-                    )
-                    LAST_PROCESSED_MOVE_COUNT = len(initial_moves_list)
-                    continue
-
-                if event_type == "gameState":
-                    status = event.get("status")
-                    if status and status != "started":
-                        logger.info("Game finished with status=%s", status)
-                        break
-                    moves_text = event.get("moves", "")
-                    moves = moves_text.split() if moves_text else []
-
-                    new_moves = moves[LAST_PROCESSED_MOVE_COUNT:]
-                    for index, move in enumerate(
-                        new_moves, start=LAST_PROCESSED_MOVE_COUNT
-                    ):
-                        mover_color = "white" if index % 2 == 0 else "black"
-                        if mover_color == human_color:
-                            logger.info("PLAYER_MOVE move=%s", move)
-                            enqueue_commentary(game_id, move, "PLAYER_MOVE")
-                        else:
-                            logger.info("AI_MOVE move=%s", move)
-                            enqueue_commentary(game_id, move, "AI_MOVE")
-                    LAST_PROCESSED_MOVE_COUNT = len(moves)
-    except requests.RequestException as exc:
-        logger.warning("Lichess stream request failed: %s", exc)
-    finally:
-        shutdown_tts_manager(game_id)
-
-
-@app.get("/debug/stream/{game_id}")
-def debug_stream(game_id: str, background_tasks: BackgroundTasks):
-    background_tasks.add_task(stream_game_state, game_id)
-    return {"status": "streaming", "game_id": game_id}
-
-
-@app.get("/debug/gemini-test")
-def debug_gemini_test():
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_key:
-        return {"error": "GEMINI_API_KEY not set"}
-
-    try:
-        client = genai.Client(api_key=gemini_key)
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents="Dis bonjour en français en une seule phrase.",
-        )
-        text = (response.text or "").strip()
-        if not text:
-            return {"error": "Empty response from Gemini"}
-        return {"text": text}
-    except Exception as exc:
-        logger.warning("Gemini test request failed: %s", exc)
-        return {"error": str(exc)}
-
-
-@app.get("/debug/mistral-test")
-def debug_mistral_test():
-    mistral_key = os.getenv("MISTRAL_API_KEY")
-    if not mistral_key:
-        return {"error": "MISTRAL_API_KEY not set"}
-
-    payload = {
-        "model": "mistral-small-latest",
-        "messages": [
-            {"role": "system", "content": "Tu es un assistant poli."},
-            {"role": "user", "content": "Dis bonjour en français en une seule phrase."},
-        ],
-    }
-
-    try:
-        response = requests.post(
-            "https://api.mistral.ai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {mistral_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=30,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        logger.warning("Mistral test request failed: %s", exc)
-        return {"error": str(exc)}
-
-    data = response.json()
-    content = (
-        data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    )
-    return {"text": content}
-
-
-@app.get("/debug/gradium-test")
-def debug_gradium_test():
-    gradium_key = os.getenv("GRADIUM_API_KEY")
-    if not gradium_key:
-        return JSONResponse(
-            status_code=500, content={"error": "GRADIUM_API_KEY not set"}
-        )
-
-    payload = {
-        "text": "Salut ! Je suis ton coach d’échecs. Test audio.",
-        "voice_id": "YTpq7expH9539ERJ",
-        "format": "pcm",
-    }
-
-    try:
-        response = requests.post(
-            "https://api.gradium.ai/v1/tts/synthesize",
-            headers={
-                "Authorization": f"Bearer {gradium_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            # TODO: Temporary PoC workaround for Gradium's self-signed SSL cert.
-            verify=False,
-            timeout=30,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        logger.warning("Gradium TTS request failed: %s", exc)
-        return JSONResponse(status_code=500, content={"error": str(exc)})
-
-    return Response(content=response.content, media_type="application/octet-stream")
-
-
-@app.post("/debug/tts-inject")
-async def debug_tts_inject(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    game_id = body.get("game_id") if isinstance(body, dict) else None
-    if not game_id:
-        raise HTTPException(status_code=400, detail="game_id missing")
-
-    manager = ensure_tts_manager()
-    if not manager:
-        raise HTTPException(status_code=500, detail="TTS manager not available")
-
-    if not APP_LOOP:
-        raise HTTPException(status_code=500, detail="App loop not ready")
-
-    text = "Salut, je suis le coach. Ceci est un test audio force."
-
-    asyncio.run_coroutine_threadsafe(
-        manager.speak(game_id, "PLAYER_MOVE", text),
-        APP_LOOP,
-    )
-
-    return {"status": "ok"}
-
-
-@app.post("/debug/tts-pcm-test")
-async def debug_tts_pcm_test(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    game_id = body.get("game_id") if isinstance(body, dict) else None
-    if not game_id:
-        raise HTTPException(status_code=400, detail="game_id missing")
-
-    manager = ensure_tts_manager()
-    if not manager:
-        raise HTTPException(status_code=500, detail="TTS manager not available")
-
-    if not APP_LOOP:
-        raise HTTPException(status_code=500, detail="App loop not ready")
-
-    text = "Salut, test PCM 24kHz."
-
-    asyncio.run_coroutine_threadsafe(
-        manager.speak(game_id, "PLAYER_MOVE", text),
-        APP_LOOP,
-    )
-
-    return {"status": "ok"}
-
-
-def enqueue_commentary(game_id: str, move_uci: str, role: str) -> None:
-    if role not in {"PLAYER_MOVE", "AI_MOVE"}:
-        raise ValueError(f"Invalid role: {role}")
-
-    global COMMENTARY_WORKER_ACTIVE
-
-    with COMMENTARY_LOCK:
-        if role == "PLAYER_MOVE":
-            if CURRENT_TURN["player_move"]:
-                _reset_current_turn()
-            CURRENT_TURN["player_move"] = move_uci
-            CURRENT_TURN["player_commented"] = True
-            COMMENTARY_QUEUE.append((game_id, move_uci, role))
-            if CURRENT_TURN["ai_move"]:
-                COMMENTARY_QUEUE.append((game_id, CURRENT_TURN["ai_move"], "AI_MOVE"))
-                CURRENT_TURN["ai_commented"] = True
-                _reset_current_turn()
-        else:
-            if CURRENT_TURN["ai_move"]:
-                _reset_current_turn()
-            CURRENT_TURN["ai_move"] = move_uci
-            if CURRENT_TURN["player_commented"]:
-                COMMENTARY_QUEUE.append((game_id, move_uci, role))
-                CURRENT_TURN["ai_commented"] = True
-                _reset_current_turn()
-
-        if COMMENTARY_WORKER_ACTIVE or not COMMENTARY_QUEUE:
-            return
-        COMMENTARY_WORKER_ACTIVE = True
-
-    worker = threading.Thread(target=process_commentary_queue, daemon=True)
-    worker.start()
-
-
-def _reset_current_turn() -> None:
-    CURRENT_TURN["player_move"] = None
-    CURRENT_TURN["ai_move"] = None
-    CURRENT_TURN["player_commented"] = False
-    CURRENT_TURN["ai_commented"] = False
-
-
-def process_commentary_queue() -> None:
-    global COMMENTARY_WORKER_ACTIVE
-
-    while True:
-        with COMMENTARY_LOCK:
-            if not COMMENTARY_QUEUE:
-                COMMENTARY_WORKER_ACTIVE = False
-                return
-            game_id, move_uci, role = COMMENTARY_QUEUE.popleft()
-
-        commentary = generate_commentary_mistral(move_uci, role)
-        if commentary:
-            logger.info(
-                'COMMENTARY role=%s text="%s"',
-                role,
-                commentary.replace('"', "'"),
-            )
-            manager = ensure_tts_manager()
-            if not manager:
-                logger.warning(
-                    "No TTS manager for game_id=%s, skipping TTS",
-                    game_id,
-                )
-            elif APP_LOOP:
-                voice_id = get_voice_id_for_game(game_id, role)
-                logger.info(
-                    "TTS speak | game_id=%s | role=%s | voice_id=%s | text_len=%s",
-                    game_id,
-                    role,
-                    voice_id,
-                    len(commentary),
-                )
-                future = asyncio.run_coroutine_threadsafe(
-                    manager.speak(game_id, role, commentary), APP_LOOP
-                )
-
-                def _handle_tts_result(result_future: asyncio.Future) -> None:
-                    try:
-                        result_future.result()
-                    except Exception:
-                        logger.exception(
-                            "TTS speak failed | game_id=%s | role=%s",
-                            game_id,
-                            role,
-                        )
-
-                future.add_done_callback(_handle_tts_result)
-            else:
-                logger.warning(
-                    "App loop not available; skipping TTS for game_id=%s",
-                    game_id,
-                )
-            publish_commentary_event(game_id, role, commentary, move_uci)
-
-
-def generate_commentary_mistral(move_uci: str, role: str) -> str | None:
-    if role not in {"PLAYER_MOVE", "AI_MOVE"}:
-        raise ValueError(f"Invalid role: {role}")
-
-    mistral_key = os.getenv("MISTRAL_API_KEY")
-    if not mistral_key:
-        logger.warning("MISTRAL_API_KEY not set; skipping commentary")
-        return None
-
-    throttle_mistral_calls()
-
-    payload = {
-        "model": "mistral-small-latest",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Tu es un coach d echecs vocal, fun, familier et tres oral. "
-                    "Tu parles comme a un ami pendant une partie.\n\n"
-                    "REGLES STRICTES (OBLIGATOIRES) :\n"
-                    "- 1 phrase, 2 maximum\n"
-                    "- texte destine a etre lu par une synthese vocale\n"
-                    "- INTERDIT :\n"
-                    "  - emojis\n"
-                    "  - smileys\n                    "  - caracteres speciaux\n"
-                    "  - guillemets typographiques\n"
-                    "  - apostrophes fantaisie\n"
-                    "- utiliser uniquement :\n"
-                    "  - lettres\n"
-                    "  - chiffres\n"
-                    "  - virgules\n"
-                    "  - points\n"
-                    "  - points d exclamation simples\n"
-                    "- pas de guillemets autour des phrases\n\n"
-                    "STYLE :\n"
-                    "- familier\n"
-                    "- complice\n"
-                    "- vivant\n"
-                    "- taquin leger\n"
-                    "- jamais mechant\n"
-                    "- jamais scolaire\n\n"
-                    "--------------------------------\n"
-                    "CAS 1 - COUP DU JOUEUR HUMAIN\n"
-                    "--------------------------------\n\n"
-                    "Tu es le COACH.\n"
-                    "Tu t adresses au joueur en disant tu.\n\n"
-                    "Objectif :\n"
-                    "- reagir a chaud\n"
-                    "- commenter une seule idee simple\n"
-                    "- encourager ou taquiner gentiment\n\n"
-                    "Exemples de style :\n"
-                    "- Allez, ca ouvre le centre, bonne idee.\n"
-                    "- Ouh la, ta dame est un peu exposee.\n"
-                    "- Pas mal, tu prends de l espace.\n"
-                    "- Attention, ca peut vite se retourner.\n\n"
-                    "--------------------------------\n"
-                    "CAS 2 - COUP DE L ORDINATEUR\n"
-                    "--------------------------------\n\n"
-                    "Tu es L ORDINATEUR.\n"
-                    "Tu parles a la premiere personne en disant je.\n\n"
-                    "Objectif :\n"
-                    "- expliquer ton intention\n"
-                    "- ton confiant\n"
-                    "- parfois provocateur, mais fun\n\n"
-                    "Exemples de style :\n"
-                    "- Je te vois venir, je developpe tranquille.\n"
-                    "- Je prends, c etait trop tentant.\n"
-                    "- Je ferme le centre, on va jouer serre.\n"
-                    "- Je contre attaque tout de suite.\n\n"
-                    "--------------------------------\n"
-                    "IMPORTANT\n"
-                    "--------------------------------\n\n"
-                    "- Pas d emojis\n"
-                    "- Pas de guillemets\n"
-                    "- Pas de caracteres non ASCII\n"
-                    "- Texte lisible a voix haute\n"
-                    "- Maximum 2 phrases"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Rôle: {role}. Coup joué (notation UCI): {move_uci}. "
-                    "Commente ce coup simplement."
-                ),
-            },
-        ],
-    }
-
-    try:
-        response = requests.post(
-            "https://api.mistral.ai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {mistral_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=30,
-        )
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        logger.warning("Mistral commentary request failed: %s", exc)
-        return None
-
-    data = response.json()
-    content = (
-        data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    )
-    return content or None
-
-
-def throttle_mistral_calls() -> None:
-    global LAST_LLM_CALL_AT
-
-    with COMMENTARY_LOCK:
-        now = time.monotonic()
-        if LAST_LLM_CALL_AT is None:
-            LAST_LLM_CALL_AT = now
-            return
-        elapsed = now - LAST_LLM_CALL_AT
-        if elapsed >= 1.0:
-            LAST_LLM_CALL_AT = now
-            return
-        sleep_for = 1.0 - elapsed
-        LAST_LLM_CALL_AT = now + sleep_for
-
-    time.sleep(sleep_for)
-
-
+# -------------------------
+# Utilities: Events / SSE
+# -------------------------
 def get_event_queue(game_id: str) -> asyncio.Queue:
+    """
+    Return (and create if missing) an asyncio.Queue attached to the current loop
+    for the given game_id. Multiple clients on the same loop will share the queue.
+    """
     loop = asyncio.get_running_loop()
     with EVENT_SUBSCRIBERS_LOCK:
         entry = EVENT_SUBSCRIBERS.get(game_id)
@@ -1225,11 +86,7 @@ def get_event_queue(game_id: str) -> asyncio.Queue:
             entry["subscribers"] += 1
             return entry["queue"]
         queue: asyncio.Queue = asyncio.Queue()
-        EVENT_SUBSCRIBERS[game_id] = {
-            "queue": queue,
-            "loop": loop,
-            "subscribers": 1,
-        }
+        EVENT_SUBSCRIBERS[game_id] = {"queue": queue, "loop": loop, "subscribers": 1}
         return queue
 
 
@@ -1244,6 +101,10 @@ def release_event_queue(game_id: str) -> None:
 
 
 def publish_event(game_id: str, event: str, payload: dict) -> None:
+    """
+    Publish an event to the SSE queue for a given game_id.
+    This function can be called from background threads (it schedules put on the loop).
+    """
     with EVENT_SUBSCRIBERS_LOCK:
         entry = EVENT_SUBSCRIBERS.get(game_id)
         if not entry:
@@ -1255,19 +116,601 @@ def publish_event(game_id: str, event: str, payload: dict) -> None:
     try:
         asyncio.run_coroutine_threadsafe(queue.put(message), loop)
     except RuntimeError as exc:
-        logger.warning("Failed to publish event: %s", exc)
+        logger.warning("Failed to publish event for game %s: %s", game_id, exc)
 
 
-def publish_commentary_event(game_id: str, role: str, text: str, move: str) -> None:
-    publish_event(
-        game_id,
-        "commentary",
-        {"role": role, "text": text, "move": move},
+# -------------------------
+# Gradium TTS manager
+# -------------------------
+class GradiumTTSManager:
+    """
+    Minimal manager to send text to Gradium TTS websocket and stream audio back
+    as SSE chunks.
+
+    Behavior:
+    - Maintains a queue of TTS jobs.
+    - Ensures small throttle between remote requests to avoid flooding.
+    - Publishes SSE events:
+      - tts-start: {"utterance_id", "sample_rate", ...}
+      - tts-audio: {"utterance_id", "audio"}  (base64 PCM chunks)
+      - tts-end: {"utterance_id"}
+    """
+
+    def __init__(self, api_key: str, region: str = "eu"):
+        self.api_key = api_key
+        self._queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
+        self._ws: websockets.WebSocketClientProtocol | None = None
+        self._last_sent = 0.0
+        self._sse_chunk_size = 4096  # bytes, even for Int16 alignment
+        self._sample_rate = 24000
+        self._output_format = "pcm_24000"
+        self._region = region
+
+    async def speak(self, game_id: str, role: str, text: str, voice_id: str) -> None:
+        """
+        Schedule a TTS job and wait for completion.
+        """
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        await self._queue.put(
+            {"game_id": game_id, "role": role, "text": text, "voice_id": voice_id, "done": fut}
+        )
+        if not self._worker_task or self._worker_task.done():
+            self._worker_task = asyncio.create_task(self._worker())
+        await fut
+
+    async def _worker(self) -> None:
+        while True:
+            job = await self._queue.get()
+            fut = job["done"]
+            try:
+                # throttle small gaps
+                elapsed = time.monotonic() - self._last_sent
+                if elapsed < 0.5:
+                    await asyncio.sleep(0.5 - elapsed)
+                await self._perform_tts(job["game_id"], job["role"], job["text"], job["voice_id"])
+                self._last_sent = time.monotonic()
+                if not fut.done():
+                    fut.set_result(None)
+            except Exception as exc:
+                logger.exception("TTS job failed: %s", exc)
+                if not fut.done():
+                    fut.set_exception(exc)
+
+    async def _ensure_ws(self) -> websockets.WebSocketClientProtocol:
+        if self._ws and not self._ws.closed:
+            return self._ws
+        url = f"wss://{self._region}.api.gradium.ai/api/speech/tts"
+        headers = [("x-api-key", self.api_key)]
+        try:
+            self._ws = await websockets.connect(url, additional_headers=headers, max_size=None)
+        except TypeError:
+            # older websockets takes extra_headers
+            self._ws = await websockets.connect(url, extra_headers=headers, max_size=None)
+        return self._ws
+
+    async def _perform_tts(self, game_id: str, role: str, text: str, voice_id: str) -> None:
+        utterance_id = uuid.uuid4().hex
+        ws = None
+        try:
+            ws = await self._ensure_ws()
+            # send setup
+            setup_payload = {
+                "type": "setup",
+                "model_name": "default",
+                "voice_id": voice_id,
+                "output_format": self._output_format,
+            }
+            await ws.send(json.dumps(setup_payload))
+            # try to read an initial ready/error (non-blocking with timeout)
+            try:
+                ready_msg = await asyncio.wait_for(ws.recv(), timeout=3)
+                # parse optional error/ready messages; ignore otherwise
+                try:
+                    data = json.loads(ready_msg)
+                    # if server complains about format, fallback to pcm 48k
+                    if isinstance(data, dict) and data.get("type") == "error":
+                        msg = str(data.get("message", ""))
+                        if "pcm_24000" in msg or "output_format" in msg:
+                            # fallback
+                            self._output_format = "pcm"
+                            self._sample_rate = 48000
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "setup",
+                                        "model_name": "default",
+                                        "voice_id": voice_id,
+                                        "output_format": "pcm",
+                                        "sample_rate": 48000,
+                                    }
+                                )
+                            )
+                except Exception:
+                    pass
+            except asyncio.TimeoutError:
+                # continue anyway
+                pass
+
+            publish_event(
+                game_id,
+                "tts-start",
+                {
+                    "role": role,
+                    "text": text,
+                    "utterance_id": utterance_id,
+                    "sample_rate": self._sample_rate,
+                    "channels": 1,
+                },
+            )
+            # send text message
+            await ws.send(json.dumps({"type": "text", "text": text}))
+
+            # receive audio frames (binary) or JSON chunks
+            seq = 0
+            async for message in ws:
+                if isinstance(message, (bytes, bytearray)):
+                    raw = bytes(message)
+                    # split into SSE-friendly base64 pieces
+                    offset = 0
+                    chunk_size = self._sse_chunk_size
+                    if chunk_size % 2 != 0:
+                        chunk_size -= 1
+                    total_len = len(raw)
+                    while offset < total_len:
+                        piece = raw[offset : offset + chunk_size]
+                        offset += len(piece)
+                        seq += 1
+                        encoded = base64.b64encode(piece).decode("ascii")
+                        publish_event(
+                            game_id,
+                            "tts-audio",
+                            {"role": role, "utterance_id": utterance_id, "sequence": seq, "audio": encoded},
+                        )
+                    continue
+
+                # try JSON
+                try:
+                    data = json.loads(message)
+                except Exception:
+                    data = None
+                if isinstance(data, dict):
+                    t = data.get("type")
+                    if t == "audio" and data.get("audio"):
+                        seq += 1
+                        encoded = data.get("audio")
+                        publish_event(
+                            game_id,
+                            "tts-audio",
+                            {"role": role, "utterance_id": utterance_id, "sequence": seq, "audio": encoded},
+                        )
+                    elif t == "error":
+                        raise RuntimeError(data.get("message") or "TTS error")
+                    elif t == "end_of_stream":
+                        break
+                # else ignore
+        except websockets.exceptions.ConnectionClosedOK:
+            # closed normally
+            pass
+        except Exception as exc:
+            logger.warning("Gradium TTS error: %s", exc)
+            # mark connection as unusable and drop it
+            if ws:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+                self._ws = None
+        finally:
+            publish_event(game_id, "tts-end", {"role": role, "utterance_id": utterance_id})
+
+
+def ensure_tts_manager() -> GradiumTTSManager | None:
+    gradium_key = os.getenv("GRADIUM_API_KEY")
+    if not gradium_key:
+        return None
+    global TTS_MANAGER
+    with TTS_MANAGER_LOCK:
+        if TTS_MANAGER:
+            return TTS_MANAGER
+        TTS_MANAGER = GradiumTTSManager(api_key=gradium_key, region=os.getenv("GRADIUM_REGION", "eu"))
+        logger.info("TTS manager created")
+        return TTS_MANAGER
+
+
+# -------------------------
+# Commentary generation
+# -------------------------
+def throttle_llm_calls() -> None:
+    global _LAST_LLM_CALL_AT
+    now = time.monotonic()
+    if _LAST_LLM_CALL_AT is None:
+        _LAST_LLM_CALL_AT = now
+        return
+    elapsed = now - _LAST_LLM_CALL_AT
+    if elapsed >= LLM_THROTTLE_SECONDS:
+        _LAST_LLM_CALL_AT = now
+        return
+    sleep = LLM_THROTTLE_SECONDS - elapsed
+    _LAST_LLM_CALL_AT = now + sleep
+    time.sleep(sleep)
+
+
+def generate_commentary_local(move_uci: str, role: str) -> str:
+    """
+    Very small deterministic fallback commentary when no LLM key is available.
+    Produces one short sentence.
+    """
+    # basic heuristics for demonstrative comments
+    templates_player = [
+        "Bien joué, tu avances une pièce vers le centre.",
+        "Pas mal, tu développes tes pièces.",
+        "Attention à la sécurité de ton roi.",
+        "Tu gagnes de l'espace, continue.",
+        "Coup simple et solide.",
+    ]
+    templates_ai = [
+        "Je réponds en consolidant le centre.",
+        "Je t'attaque la case faible.",
+        "Je développe et mets la pression.",
+        "Je crée des menaces sur ton roi.",
+        "Je simplifie la position en échangeant.",
+    ]
+    import hashlib
+
+    h = int(hashlib.sha1(move_uci.encode()).hexdigest()[:8], 16)
+    if role == "PLAYER_MOVE":
+        return templates_player[h % len(templates_player)]
+    return templates_ai[h % len(templates_ai)]
+
+
+def generate_commentary_mistral(move_uci: str, role: str) -> str | None:
+    """
+    If MISTRAL_API_KEY is set, call Mistral chat completions to produce a 1-2 sentence
+    commentary in French (or a short English fallback). Otherwise use a local heuristic.
+    """
+    mistral_key = os.getenv("MISTRAL_API_KEY")
+    if not mistral_key:
+        return generate_commentary_local(move_uci, role)
+
+    # Throttle LLM calls across threads
+    throttle_llm_calls()
+
+    system_prompt = """Tu es un coach d'echecs vocal, familier et encourageant. Réponds par 1 phrase (2 max), lisible à voix haute, sans emojis ni guillemets, pas de caractères non-ASCII."""
+
+    payload = {
+        "model": "mistral-small-latest",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"Rôle: {role}. Coup joué (UCI): {move_uci}. Commente ce coup simplement (1 phrase).",
+            },
+        ],
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.mistral.ai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {mistral_key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        if text:
+            # sanitize: keep ASCII-ish text
+            return text.replace("“", '"').replace("”", '"')
+    except Exception as exc:
+        logger.warning("Mistral commentary failed: %s", exc)
+    return generate_commentary_local(move_uci, role)
+
+
+# -------------------------
+# Commentary queue processing
+# -------------------------
+def enqueue_commentary(game_id: str, move_uci: str, role: str) -> None:
+    """
+    Enqueue a move for commentary. Maintains logic so player move commentary is prioritized
+    before AI commentary for the same half-turn.
+    """
+    global COMMENTARY_WORKER_ACTIVE
+
+    with COMMENTARY_LOCK:
+        if role == "PLAYER_MOVE":
+            # append player move; if there is a pending ai_move for same turn, schedule it after player's comment
+            COMMENTARY_QUEUE.append((game_id, move_uci, "PLAYER_MOVE"))
+        else:
+            # AI move: if player commentary already queued but not yet processed, ensure AI comes after
+            COMMENTARY_QUEUE.append((game_id, move_uci, "AI_MOVE"))
+
+        if COMMENTARY_WORKER_ACTIVE or not COMMENTARY_QUEUE:
+            return
+        COMMENTARY_WORKER_ACTIVE = True
+
+    worker = threading.Thread(target=process_commentary_queue, daemon=True)
+    worker.start()
+
+
+def process_commentary_queue() -> None:
+    """
+    Worker thread that consumes COMMENTARY_QUEUE and:
+    - generates a short commentary (mistral or local)
+    - publishes "commentary" SSE event with role/text
+    - sends to TTS manager to speak and publish tts events (non-blocking)
+    """
+    global COMMENTARY_WORKER_ACTIVE
+
+    while True:
+        with COMMENTARY_LOCK:
+            if not COMMENTARY_QUEUE:
+                COMMENTARY_WORKER_ACTIVE = False
+                return
+            game_id, move_uci, role = COMMENTARY_QUEUE.popleft()
+
+        # generate commentary
+        commentary = generate_commentary_mistral(move_uci, role)
+        if not commentary:
+            continue
+
+        logger.info('COMMENTARY game=%s role=%s text="%s"', game_id, role, commentary)
+        # publish simple commentary event (for text log)
+        publish_event(game_id, "commentary", {"role": role, "text": commentary, "move": move_uci})
+
+        manager = ensure_tts_manager()
+        if manager and APP_LOOP:
+            # choose voice for role
+            with GAME_CONTEXTS_LOCK:
+                gc = GAME_CONTEXTS.get(game_id, {})
+            voice_id = gc.get("voice_coach_id" if role == "PLAYER_MOVE" else "voice_ai_id", DEFAULT_VOICE_COACH_ID)
+            # schedule TTS speak on asyncio loop
+            fut = asyncio.run_coroutine_threadsafe(manager.speak(game_id, role, commentary, voice_id), APP_LOOP)
+
+            # attach callback to log TTS completion or failure
+            def _done(f):
+                try:
+                    f.result()
+                except Exception:
+                    logger.exception("TTS failed for game %s role %s", game_id, role)
+
+            fut.add_done_callback(_done)
+
+
+# -------------------------
+# Lichess streaming
+# -------------------------
+def stream_game_state_thread(game_id: str) -> None:
+    """
+    Blocking thread target — connects to Lichess stream and enqueues commentary
+    for moves as they arrive. Runs in a separate daemon thread.
+    """
+    lichess_token = os.getenv("LICHESS_TOKEN")
+    if not lichess_token:
+        logger.error("LICHESS_TOKEN not set; cannot stream game %s", game_id)
+        return
+
+    stream_url = f"https://lichess.org/api/board/game/stream/{game_id}"
+    headers = {"Authorization": f"Bearer {lichess_token}", "Accept": "application/json"}
+    human_color = None
+    last_processed = 0
+
+    try:
+        with requests.get(stream_url, headers=headers, stream=True, timeout=90) as resp:
+            resp.raise_for_status()
+            logger.info("Connected to lichess stream for game %s", game_id)
+            for line in resp.iter_lines(chunk_size=65536):
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line.decode("utf-8"))
+                except Exception:
+                    continue
+                typ = ev.get("type")
+                if typ == "gameFull":
+                    white = ev.get("white", {})
+                    black = ev.get("black", {})
+                    if "aiLevel" in white:
+                        human_color = "black"
+                    elif "aiLevel" in black:
+                        human_color = "white"
+                    else:
+                        human_color = None
+                    moves = ev.get("state", {}).get("moves", "")
+                    last_processed = len(moves.split()) if moves else 0
+                    logger.info("gameFull received game=%s human_color=%s", game_id, human_color)
+                elif typ == "gameState":
+                    status = ev.get("status")
+                    if status and status != "started":
+                        logger.info("Game %s finished status=%s", game_id, status)
+                        break
+                    moves_text = ev.get("moves", "")
+                    moves = moves_text.split() if moves_text else []
+                    if len(moves) <= last_processed:
+                        continue
+                    new_moves = moves[last_processed:]
+                    for idx, mv in enumerate(new_moves, start=last_processed):
+                        mover_color = "white" if idx % 2 == 0 else "black"
+                        role = "PLAYER_MOVE" if mover_color == human_color else "AI_MOVE"
+                        logger.info("game=%s new move %s role=%s", game_id, mv, role)
+                        enqueue_commentary(game_id, mv, role)
+                    last_processed = len(moves)
+    except Exception as exc:
+        logger.warning("Lichess streaming for game %s failed: %s", game_id, exc)
+    finally:
+        # cleanup game context (free voices)
+        with GAME_CONTEXTS_LOCK:
+            GAME_CONTEXTS.pop(game_id, None)
+        logger.info("Stopped streaming game %s", game_id)
+
+
+# -------------------------
+# HTTP endpoints
+# -------------------------
+@app.on_event("startup")
+async def _startup():
+    global APP_LOOP
+    APP_LOOP = asyncio.get_running_loop()
+    logger.info("App loop set")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.get("/")
+def demo_html():
+    """
+    Very small demo page that uses SSE to receive events (commentary + tts chunks)
+    and plays PCM chunks in the browser via AudioContext.
+    For brevity the page is kept minimal; the front (GitHub Pages) can host a nicer UI.
+    """
+    html = f"""<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<title>Gradium Chess Demo</title>
+<style>body{{font-family:Arial,Helvetica,sans-serif;margin:24px}}button{{padding:12px 18px;font-size:16px}}</style>
+</head>
+<body>
+<h1>Gradium Chess — Demo</h1>
+<p><button id="start">Démarrer la démo</button> <button id="tts-test">Tester la voix</button></p>
+<div id="log" style="white-space:pre-wrap;font-family:monospace;background:#f3f4f6;padding:12px;border-radius:8px;max-height:200px;overflow:auto"></div>
+<script>
+let gameId = null;
+let audioCtx, nextTime=0, queue=Promise.resolve(), currentUtterance=null, sr=24000;
+function log(s){document.getElementById('log').textContent = new Date().toLocaleTimeString() + ' ' + s + '\\n' + document.getElementById('log').textContent}
+function ensureAudio(){ if(!audioCtx) audioCtx = new (window.AudioContext||window.webkitAudioContext)(); if(audioCtx.state==='suspended') audioCtx.resume().catch(()=>{}); }
+function base64ToInt16(base64){
+  const binary = atob(base64);
+  const len = binary.length;
+  const buf = new ArrayBuffer(len);
+  const view = new Uint8Array(buf);
+  for(let i=0;i<len;i++) view[i]=binary.charCodeAt(i);
+  return new Int16Array(buf);
+}
+function pcmToAudioBuffer(pcm16, sampleRate){
+  ensureAudio();
+  const audioBuffer = audioCtx.createBuffer(1, pcm16.length, sampleRate);
+  const ch = audioBuffer.getChannelData(0);
+  for(let i=0;i<pcm16.length;i++) ch[i] = pcm16[i]/32768;
+  return audioBuffer;
+}
+function schedule(buffer){
+  const src = audioCtx.createBufferSource();
+  src.buffer = buffer;
+  src.connect(audioCtx.destination);
+  const now = audioCtx.currentTime;
+  if(!Number.isFinite(nextTime) || nextTime < now) nextTime = now + 0.05;
+  src.start(nextTime);
+  nextTime += buffer.duration;
+  return new Promise(r=>src.onended=r);
+}
+function playChunk(base64, sampleRate){
+  const pcm = base64ToInt16(base64);
+  const audioBuffer = pcmToAudioBuffer(pcm, sampleRate);
+  queue = queue.then(()=>schedule(audioBuffer));
+  return queue;
+}
+document.getElementById('start').addEventListener('click', async ()=>{
+  const r = await fetch('/start-game-demo');
+  const j = await r.json();
+  gameId = j.game_id;
+  if(j.game_url) window.open(j.game_url,'_blank');
+  log('Game created: ' + gameId);
+  const es = new EventSource('/events/' + gameId);
+  es.addEventListener('commentary', e=>{
+    try{ const p = JSON.parse(e.data); log(p.role + ': ' + p.text); }catch{}
+  });
+  es.addEventListener('tts-start', e=>{
+    try{ const p = JSON.parse(e.data); currentUtterance = p.utterance_id; if(p.sample_rate) sr = p.sample_rate; ensureAudio(); nextTime = audioCtx.currentTime + 0.05; }catch{}
+  });
+  es.addEventListener('tts-audio', e=>{
+    try{
+      const p = JSON.parse(e.data);
+      if(!p.audio) return;
+      if(p.utterance_id !== currentUtterance) return;
+      playChunk(p.audio, sr).catch(err=>console.error(err));
+    }catch(err){}
+  });
+  es.addEventListener('tts-end', e=>{
+    try{ const p = JSON.parse(e.data); if(p.utterance_id===currentUtterance) currentUtterance=null; }catch{}
+  });
+});
+document.getElementById('tts-test').addEventListener('click', async ()=>{
+  if(!gameId){ alert('Start a game first'); return;}
+  await fetch('/debug/tts-inject', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({game_id:gameId})});
+});
+</script>
+</body>
+</html>"""
+    return Response(content=html, media_type="text/html")
+
+
+@app.get("/start-game-demo")
+def start_game_demo(request: Request):
+    """
+    Creates a lichess human vs AI game and starts the background stream thread.
+    Returns JSON {game_id, game_url}
+    """
+    lichess_token = os.getenv("LICHESS_TOKEN")
+    if not lichess_token:
+        raise HTTPException(status_code=500, detail="LICHESS_TOKEN not set")
+
+    ai_level = 3
+    try:
+        ai_level_env = os.getenv("AI_LEVEL")
+        if ai_level_env:
+            ai_level = int(ai_level_env)
+    except Exception:
+        ai_level = 3
+
+    # voices can be overridden by query params for testing
+    voice_coach = request.query_params.get("voice_coach", DEFAULT_VOICE_COACH_ID)
+    voice_ai = request.query_params.get("voice_ai", DEFAULT_VOICE_AI_ID)
+
+    payload = urllib.parse.urlencode({"level": ai_level, "clock.limit": 600, "clock.increment": 0, "rated": "false"}).encode(
+        "utf-8"
     )
+    req = urllib.request.Request(
+        "https://lichess.org/api/challenge/ai",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {lichess_token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        logger.exception("Lichess create game failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Failed to create lichess game")
+
+    game_id = data.get("id") or data.get("game", {}).get("id") or data.get("challenge", {}).get("id")
+    if not game_id:
+        raise HTTPException(status_code=502, detail="Lichess response missing game id")
+
+    game_url = f"https://lichess.org/{game_id}"
+    with GAME_CONTEXTS_LOCK:
+        GAME_CONTEXTS[game_id] = {"game_id": game_id, "voice_coach_id": voice_coach, "voice_ai_id": voice_ai}
+
+    # start blocking stream in a daemon thread (so FastAPI thread isn't blocked)
+    t = threading.Thread(target=stream_game_state_thread, args=(game_id,), daemon=True)
+    t.start()
+
+    return {"game_id": game_id, "game_url": game_url}
 
 
 @app.get("/events/{game_id}")
 async def events(game_id: str):
+    """
+    SSE endpoint for clients to receive commentary and TTS audio chunks.
+    """
     queue = get_event_queue(game_id)
 
     async def event_stream():
@@ -1279,6 +722,7 @@ async def events(game_id: str):
                 data = json.dumps(payload, ensure_ascii=False)
                 yield f"event: {event}\ndata: {data}\n\n"
         except asyncio.CancelledError:
+            # client disconnected
             raise
         finally:
             release_event_queue(game_id)
@@ -1286,277 +730,32 @@ async def events(game_id: str):
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-@app.get("/demo")
-def demo():
-    html = """<!doctype html>
-<html lang="fr">
-  <head>
-    <meta charset="utf-8" />
-    <title>Gradium Chess Demo</title>
-    <style>
-      body {
-        font-family: "Helvetica Neue", Arial, sans-serif;
-        margin: 32px;
-        background: #0f172a;
-        color: #e2e8f0;
-      }
-      h1 {
-        margin-bottom: 8px;
-      }
-      .card {
-        background: #111827;
-        border: 1px solid #1f2937;
-        border-radius: 12px;
-        padding: 16px 20px;
-        margin-top: 16px;
-      }
-      .status {
-        display: inline-block;
-        padding: 4px 10px;
-        border-radius: 999px;
-        font-size: 12px;
-        background: #1e293b;
-        margin-left: 8px;
-      }
-      .status.connected {
-        background: #16a34a;
-        color: white;
-      }
-      .log {
-        white-space: pre-wrap;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
-          "Courier New", monospace;
-        font-size: 12px;
-        background: #0b1220;
-        border-radius: 8px;
-        padding: 12px;
-        max-height: 200px;
-        overflow: auto;
-      }
-      .debug-button {
-        margin-top: 12px;
-        padding: 10px 16px;
-        border-radius: 8px;
-        border: none;
-        background: #2563eb;
-        color: white;
-        font-weight: 600;
-        cursor: pointer;
-      }
-      .debug-button:disabled {
-        cursor: not-allowed;
-        opacity: 0.6;
-      }
-    </style>
-  </head>
-  <body>
-    <h1>Gradium Chess Demo</h1>
-    <div class="card">
-      <div>Game ID: <span id="game-id">—</span></div>
-      <div>Game URL: <a id="game-url" href="#" target="_blank" rel="noreferrer">—</a></div>
-      <div>
-        SSE: <span id="sse-status" class="status">connecting…</span>
-        TTS: <span id="tts-status" class="status">idle</span>
-      </div>
-      <button id="tts-test" class="debug-button">🔊 Tester la voix (debug)</button>
-    </div>
+@app.post("/debug/tts-inject")
+async def debug_tts_inject(request: Request):
+    """
+    Trigger a debug TTS message into the game stream to test playback.
+    """
+    body = await request.json()
+    game_id = body.get("game_id")
+    if not game_id:
+        raise HTTPException(status_code=400, detail="game_id missing")
 
-    <div class="card">
-      <h3>Commentary log</h3>
-      <div id="log" class="log"></div>
-    </div>
+    manager = ensure_tts_manager()
+    if not manager:
+        raise HTTPException(status_code=500, detail="TTS manager not available (set GRADIUM_API_KEY)")
 
-    <script>
-      const logEl = document.getElementById("log");
-      const gameIdEl = document.getElementById("game-id");
-      const gameUrlEl = document.getElementById("game-url");
-      const sseStatusEl = document.getElementById("sse-status");
-      const ttsStatusEl = document.getElementById("tts-status");
-      const ttsTestButton = document.getElementById("tts-test");
+    if not APP_LOOP:
+        raise HTTPException(status_code=500, detail="App loop not ready")
 
-      let audioContext = null;
-      let currentUtteranceId = null;
-      let playbackQueue = Promise.resolve();
-      let nextPlaybackTime = 0;
-      let currentSampleRate = 24000;
+    text = "Salut, je suis le coach. Ceci est un test audio."
+    with GAME_CONTEXTS_LOCK:
+        ctx = GAME_CONTEXTS.get(game_id, {})
+    voice = ctx.get("voice_coach_id", DEFAULT_VOICE_COACH_ID)
 
-      function ensureAudioContext() {
-        if (!audioContext) {
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        }
-        if (audioContext.state === "suspended") {
-          audioContext.resume().catch(() => {});
-        }
-      }
+    asyncio.run_coroutine_threadsafe(manager.speak(game_id, "PLAYER_MOVE", text, voice), APP_LOOP)
+    return {"status": "ok"}
 
-      function decodeBase64ToArrayBuffer(base64Audio) {
-        const binary = atob(base64Audio);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i += 1) {
-          bytes[i] = binary.charCodeAt(i);
-        }
-        return bytes.buffer;
-      }
 
-      function decodeBase64ToInt16(base64Audio) {
-        const buffer = decodeBase64ToArrayBuffer(base64Audio);
-        return new Int16Array(buffer);
-      }
-
-      function log(message) {
-        const line = `[${new Date().toLocaleTimeString()}] ${message}\n`;
-        logEl.textContent = line + logEl.textContent;
-      }
-
-      function showThinking() {
-        ttsStatusEl.textContent = "🎧 Le coach réfléchit…";
-        ttsStatusEl.classList.add("connected");
-      }
-
-      function clearThinking() {
-        ttsStatusEl.textContent = "idle";
-        ttsStatusEl.classList.remove("connected");
-      }
-
-      function pcmToAudioBuffer(pcmData, sampleRate) {
-        ensureAudioContext();
-        const audioBuffer = audioContext.createBuffer(1, pcmData.length, sampleRate);
-        const channel = audioBuffer.getChannelData(0);
-        for (let i = 0; i < pcmData.length; i += 1) {
-          channel[i] = pcmData[i] / 32768;
-        }
-        return audioBuffer;
-      }
-
-      function schedulePlayback(audioBuffer) {
-        const source = audioContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(audioContext.destination);
-        const now = audioContext.currentTime;
-        const startAt = Math.max(now, nextPlaybackTime || now);
-        source.start(startAt);
-        nextPlaybackTime = startAt + audioBuffer.duration;
-        return new Promise((resolve) => {
-          source.onended = resolve;
-        });
-      }
-
-      function playPcmChunk(base64Audio, sampleRate) {
-        const pcmData = decodeBase64ToInt16(base64Audio);
-        const audioBuffer = pcmToAudioBuffer(pcmData, sampleRate);
-        playbackQueue = playbackQueue.then(() => schedulePlayback(audioBuffer));
-        return playbackQueue;
-      }
-
-      function handleCommentary(payload) {
-        if (!payload || !payload.text || !payload.role) {
-          return;
-        }
-        log(`${payload.role}: ${payload.text}`);
-      }
-
-      async function startDemo() {
-        const response = await fetch("/start-game-demo");
-        const data = await response.json();
-        gameIdEl.textContent = data.game_id || "—";
-        gameUrlEl.textContent = data.game_url || "—";
-        gameUrlEl.href = data.game_url || "#";
-
-        const eventSource = new EventSource(`/events/${data.game_id}`);
-        eventSource.addEventListener("commentary", (event) => {
-          try {
-            const payload = JSON.parse(event.data);
-            handleCommentary(payload);
-          } catch (error) {
-            return;
-          }
-        });
-        eventSource.addEventListener("tts-start", (event) => {
-          let utteranceId = null;
-          try {
-            const payload = JSON.parse(event.data);
-            utteranceId = payload && payload.utterance_id;
-            if (payload && payload.sample_rate) {
-              currentSampleRate = payload.sample_rate;
-            }
-          } catch (error) {
-            utteranceId = null;
-          }
-          if (!utteranceId) {
-            return;
-          }
-          currentUtteranceId = utteranceId;
-          playbackQueue = Promise.resolve();
-          nextPlaybackTime = audioContext ? audioContext.currentTime : 0;
-          showThinking();
-        });
-        eventSource.addEventListener("tts-audio", (event) => {
-          try {
-            const payload = JSON.parse(event.data);
-            if (payload && payload.audio && payload.utterance_id != null) {
-              if (payload.utterance_id !== currentUtteranceId) {
-                return;
-              }
-              playPcmChunk(payload.audio, currentSampleRate).catch((error) => {
-                console.log("PCM playback failed", error);
-              });
-            }
-          } catch (error) {
-            return;
-          }
-        });
-        eventSource.addEventListener("tts-end", (event) => {
-          let utteranceId = null;
-          try {
-            const payload = JSON.parse(event.data);
-            utteranceId = payload && payload.utterance_id;
-          } catch (error) {
-            utteranceId = null;
-          }
-          if (!utteranceId) {
-            return;
-          }
-          console.log(`tts-end u=${utteranceId}`);
-          if (utteranceId === currentUtteranceId) {
-            currentUtteranceId = null;
-          }
-          clearThinking();
-        });
-        eventSource.addEventListener("open", () => {
-          sseStatusEl.textContent = "connected";
-          sseStatusEl.classList.add("connected");
-        });
-        eventSource.addEventListener("error", () => {
-          sseStatusEl.textContent = "disconnected";
-          sseStatusEl.classList.remove("connected");
-        });
-      }
-
-      ttsTestButton.addEventListener("click", async () => {
-        const gameId = gameIdEl.textContent;
-        if (!gameId || gameId === "—") {
-          alert("Game ID non disponible");
-          return;
-        }
-        ttsTestButton.disabled = true;
-        try {
-          await fetch("/debug/tts-inject", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ game_id: gameId }),
-          });
-        } finally {
-          ttsTestButton.disabled = false;
-        }
-      });
-
-      startDemo();
-
-      document.addEventListener("click", () => {
-        ensureAudioContext();
-      });
-    </script>
-  </body>
-</html>
-"""
-    return Response(content=html, media_type="text/html")
+# -------------------------
+# End of file
+# -------------------------
