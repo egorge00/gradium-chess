@@ -85,9 +85,13 @@ def demo_root():
       const ttsFeedbackEl = document.getElementById("tts-feedback");
       let audioContext = null;
       let currentUtteranceId = null;
+      let drainingUtteranceId = null;
+      let drainPromise = null;
       let playbackQueue = Promise.resolve();
       let nextPlaybackTime = 0;
       let currentSampleRate = 24000;
+      const safetyGapSeconds = 0.005;
+      const rampDurationSeconds = 0.004;
 
       function ensureAudioContext() {
         if (!audioContext) {
@@ -127,8 +131,21 @@ def demo_root():
         ensureAudioContext();
         const audioBuffer = audioContext.createBuffer(1, pcmData.length, sampleRate);
         const channel = audioBuffer.getChannelData(0);
+        const rampSamples = Math.min(
+          Math.floor(sampleRate * rampDurationSeconds),
+          Math.floor(pcmData.length / 2),
+        );
+        const totalSamples = pcmData.length;
         for (let i = 0; i < pcmData.length; i += 1) {
-          channel[i] = pcmData[i] / 32768;
+          let value = pcmData[i] / 32768;
+          if (rampSamples > 0) {
+            if (i < rampSamples) {
+              value *= i / rampSamples;
+            } else if (i >= totalSamples - rampSamples) {
+              value *= (totalSamples - i - 1) / rampSamples;
+            }
+          }
+          channel[i] = value;
         }
         return audioBuffer;
       }
@@ -138,9 +155,15 @@ def demo_root():
         source.buffer = audioBuffer;
         source.connect(audioContext.destination);
         const now = audioContext.currentTime;
-        const startAt = Math.max(now, nextPlaybackTime || now);
+        if (!Number.isFinite(nextPlaybackTime)) {
+          nextPlaybackTime = now;
+        }
+        if (nextPlaybackTime < now) {
+          nextPlaybackTime = now;
+        }
+        const startAt = Math.max(now, nextPlaybackTime);
         source.start(startAt);
-        nextPlaybackTime = startAt + audioBuffer.duration;
+        nextPlaybackTime = startAt + audioBuffer.duration + safetyGapSeconds;
         return new Promise((resolve) => {
           source.onended = resolve;
         });
@@ -190,6 +213,8 @@ def demo_root():
             return;
           }
           currentUtteranceId = utteranceId;
+          drainingUtteranceId = null;
+          drainPromise = null;
           playbackQueue = Promise.resolve();
           nextPlaybackTime = audioContext ? audioContext.currentTime : 0;
           showThinking();
@@ -198,7 +223,10 @@ def demo_root():
           try {
             const payload = JSON.parse(event.data);
             if (payload && payload.audio && payload.utterance_id != null) {
-              if (payload.utterance_id !== currentUtteranceId) {
+              if (
+                payload.utterance_id !== currentUtteranceId &&
+                payload.utterance_id !== drainingUtteranceId
+              ) {
                 return;
               }
               playPcmChunk(payload.audio, currentSampleRate).catch((error) => {
@@ -222,9 +250,19 @@ def demo_root():
           }
           console.log(`tts-end u=${utteranceId}`);
           if (utteranceId === currentUtteranceId) {
-            currentUtteranceId = null;
+            drainingUtteranceId = utteranceId;
+            if (!drainPromise) {
+              drainPromise = playbackQueue.then(() => {
+                if (drainingUtteranceId === utteranceId) {
+                  if (currentUtteranceId === utteranceId) {
+                    currentUtteranceId = null;
+                  }
+                  drainingUtteranceId = null;
+                  clearThinking();
+                }
+              });
+            }
           }
-          clearThinking();
         });
       }
 
