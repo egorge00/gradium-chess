@@ -298,6 +298,8 @@ class GradiumTTSManager:
         self._connection_failed = False
         self._sample_rate = 24000
         self._output_format = "pcm_24000"
+        # max bytes per SSE chunk (must be even number for Int16 alignment)
+        self._sse_chunk_size = 4096
 
     async def speak(self, game_id: str, role: str, text: str) -> None:
         if role not in {"PLAYER_MOVE", "AI_MOVE"}:
@@ -536,24 +538,38 @@ class GradiumTTSManager:
         try:
             async for message in ws:
                 if isinstance(message, (bytes, bytearray)):
-                    sequence += 1
-                    encoded_audio = base64.b64encode(message).decode("ascii")
-                    publish_event(
-                        game_id,
-                        "tts-audio",
-                        {
-                            "role": role,
-                            "utterance_id": utterance_id,
-                            "sequence": sequence,
-                            "chunk": encoded_audio,
-                            "audio": encoded_audio,
-                        },
-                    )
-                    logger.info(
-                        "TTS received audio bytes size=%s seq=%s",
-                        len(message),
-                        sequence,
-                    )
+                    # Split large binary payloads into smaller SSE-friendly chunks.
+                    # Ensure chunk byte length is even so Int16 framing remains aligned on the client.
+                    raw = bytes(message)
+                    chunk_size = self._sse_chunk_size
+                    if chunk_size % 2 != 0:
+                        chunk_size -= 1
+                    total_len = len(raw)
+                    offset = 0
+                    while offset < total_len:
+                        piece = raw[offset : offset + chunk_size]
+                        if not piece:
+                            break
+                        offset += len(piece)
+                        sequence += 1
+                        encoded_audio = base64.b64encode(piece).decode("ascii")
+                        publish_event(
+                            game_id,
+                            "tts-audio",
+                            {
+                                "role": role,
+                                "utterance_id": utterance_id,
+                                "sequence": sequence,
+                                "chunk": encoded_audio,
+                                "audio": encoded_audio,
+                            },
+                        )
+                        logger.info(
+                            "TTS received audio piece size=%s total_offset=%s seq=%s",
+                            len(piece),
+                            offset,
+                            sequence,
+                        )
                     continue
 
                 try:
@@ -1096,8 +1112,7 @@ def generate_commentary_mistral(move_uci: str, role: str) -> str | None:
                     "- texte destine a etre lu par une synthese vocale\n"
                     "- INTERDIT :\n"
                     "  - emojis\n"
-                    "  - smileys\n"
-                    "  - caracteres speciaux\n"
+                    "  - smileys\n                    "  - caracteres speciaux\n"
                     "  - guillemets typographiques\n"
                     "  - apostrophes fantaisie\n"
                     "- utiliser uniquement :\n"
@@ -1389,7 +1404,7 @@ def demo():
       }
 
       function log(message) {
-        const line = `[${new Date().toLocaleTimeString()}] ${message}\\n`;
+        const line = `[${new Date().toLocaleTimeString()}] ${message}\n`;
         logEl.textContent = line + logEl.textContent;
       }
 
