@@ -1,97 +1,92 @@
 import os
-import json
-import asyncio
-import struct
-import websockets
+import requests
+import urllib3
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, Response
 
-app = FastAPI()
+# --- CONFIG -------------------------------------------------
 
 TEXT = "Bonjour, je m'appelle Georges"
 VOICE_ID = "b35yykvVppLXyw_l"
-SAMPLE_RATE = 24000
+GRADIUM_TTS_URL = "https://api.gradium.ai/v1/tts/synthesize"
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-@app.get("/", response_class=HTMLResponse)
+app = FastAPI()
+
+# --- FRONT --------------------------------------------------
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
 <!doctype html>
-<html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <title>Gradium TTS Test</title>
+</head>
 <body>
-  <button onclick="alert('CLICK OK')">Go</button>
+  <h1>Test Gradium TTS</h1>
+  <p>Phrase : <b>Bonjour, je m'appelle Georges</b></p>
+  <button id="go">Go</button>
+
+  <script>
+    document.getElementById("go").addEventListener("click", async () => {
+      console.log("CLICK OK");
+
+      const response = await fetch("/tts", { method: "POST" });
+
+      if (!response.ok) {
+        alert("Erreur TTS");
+        return;
+      }
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+
+      const audio = new Audio(url);
+      audio.play();
+    });
+  </script>
 </body>
 </html>
 """
 
+# --- BACKEND ------------------------------------------------
 
 @app.post("/tts")
-async def tts():
+def tts():
     api_key = os.getenv("GRADIUM_API_KEY")
     if not api_key:
         return Response("Missing GRADIUM_API_KEY", status_code=500)
 
-    pcm_chunks = []
+    payload = {
+        "text": TEXT,
+        "voice_id": VOICE_ID,
+        "format": "wav"
+    }
 
-    async with websockets.connect(
-        "wss://eu.api.gradium.ai/api/speech/tts",
-        additional_headers=[("x-api-key", api_key)],
-        max_size=None,
-    ) as ws:
-        # 1️⃣ setup
-        await ws.send(json.dumps({
-            "type": "setup",
-            "model_name": "default",
-            "voice_id": VOICE_ID,
-            "output_format": "pcm_24000",
-        }))
+    try:
+        response = requests.post(
+            GRADIUM_TTS_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+            verify=False,  # recommandé par Gradium en dev
+        )
+    except requests.RequestException as e:
+        return Response(f"Gradium request failed: {e}", status_code=502)
 
-        # attendre ready
-        while True:
-            msg = json.loads(await ws.recv())
-            if msg.get("type") == "ready":
-                break
+    if response.status_code != 200:
+        return Response(
+            f"Gradium error {response.status_code}: {response.text}",
+            status_code=502,
+        )
 
-        # 2️⃣ envoyer le texte
-        await ws.send(json.dumps({
-            "type": "text",
-            "text": TEXT,
-        }))
-
-        # 3️⃣ recevoir l'audio
-        while True:
-            msg = await ws.recv()
-            if isinstance(msg, bytes):
-                pcm_chunks.append(msg)
-            else:
-                data = json.loads(msg)
-                if data.get("type") in ("end", "done", "final"):
-                    break
-
-    pcm = b"".join(pcm_chunks)
-
-    # 4️⃣ convertir PCM → WAV
-    wav = pcm_to_wav(pcm, SAMPLE_RATE)
-
-    return Response(content=wav, media_type="audio/wav")
-
-
-def pcm_to_wav(pcm: bytes, sample_rate: int) -> bytes:
-    num_channels = 1
-    bits_per_sample = 16
-    byte_rate = sample_rate * num_channels * bits_per_sample // 8
-    block_align = num_channels * bits_per_sample // 8
-    data_size = len(pcm)
-    chunk_size = 36 + data_size
-
-    return (
-        b"RIFF"
-        + struct.pack("<I", chunk_size)
-        + b"WAVEfmt "
-        + struct.pack("<IHHIIHH", 16, 1, num_channels, sample_rate,
-                       byte_rate, block_align, bits_per_sample)
-        + b"data"
-        + struct.pack("<I", data_size)
-        + pcm
+    return Response(
+        content=response.content,
+        media_type="audio/wav"
     )
