@@ -4,17 +4,13 @@ import urllib3
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, Response
 
-# --- CONFIG -------------------------------------------------
+app = FastAPI()
 
 TEXT = "Bonjour, je m'appelle Georges"
 VOICE_ID = "b35yykvVppLXyw_l"
-GRADIUM_TTS_URL = "https://api.gradium.ai/v1/tts/synthesize"
+GRADIUM_URL = "https://eu.api.gradium.ai/api/speech/tts"
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-app = FastAPI()
-
-# --- FRONT --------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -30,28 +26,25 @@ def index():
   <p>Phrase : <b>Bonjour, je m'appelle Georges</b></p>
   <button id="go">Go</button>
 
- <script>
-  document.getElementById("go").addEventListener("click", async () => {
-    const response = await fetch("/tts", { method: "POST" });
+  <script>
+    document.getElementById("go").addEventListener("click", async () => {
+      const response = await fetch("/tts", { method: "POST" });
 
-    if (!response.ok) {
-      const text = await response.text();
-      alert("Erreur TTS : " + text);
-      return;
-    }
+      if (!response.ok) {
+        const text = await response.text();
+        alert("Erreur TTS : " + text);
+        return;
+      }
 
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-
-    const audio = new Audio(url);
-    audio.play();
-  });
-</script>
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.play();
+    });
+  </script>
 </body>
 </html>
 """
-
-# --- BACKEND ------------------------------------------------
 
 @app.post("/tts")
 def tts():
@@ -60,32 +53,29 @@ def tts():
         return Response("Missing GRADIUM_API_KEY", status_code=500)
 
     payload = {
+        "type": "text",
         "text": TEXT,
         "voice_id": VOICE_ID,
-        "format": "wav"
     }
 
     try:
-        response = requests.post(
-            GRADIUM_TTS_URL,
+        r = requests.post(
+            GRADIUM_URL,
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "x-api-key": api_key,
                 "Content-Type": "application/json",
             },
             json=payload,
             timeout=30,
-            verify=False,  # recommandé par Gradium en dev
+            verify=False,
         )
     except requests.RequestException as e:
         return Response(f"Gradium request failed: {e}", status_code=502)
 
-    if response.status_code != 200:
+    if r.status_code != 200:
         return Response(
-            f"Gradium error {response.status_code}: {response.text}",
+            f"Gradium error {r.status_code}: {r.text}",
             status_code=502,
         )
 
-    return Response(
-        content=response.content,
-        media_type="audio/wav"
-    )
+    return Response(content=r.content, media_type="audio/wav")
