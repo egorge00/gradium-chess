@@ -593,7 +593,7 @@ def demo_html():
     and plays PCM chunks in the browser via AudioContext.
     For brevity the page is kept minimal; the front (GitHub Pages) can host a nicer UI.
     """
-    html = f"""<!doctype html>
+    html = """<!doctype html>
 <html lang="fr">
 <head>
 <meta charset="utf-8" />
