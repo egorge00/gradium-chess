@@ -1,11 +1,14 @@
 import os
 import requests
+import urllib3
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, Response
 
 app = FastAPI()
 
 TEXT = "Bonjour, je m'appelle Georges"
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -52,15 +55,22 @@ def tts():
         "format": "wav"
     }
 
-    r = requests.post(
-        "https://api.gradium.ai/v1/tts/synthesize",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        },
-        json=payload,
-        timeout=30
-    )
+    try:
+        r = requests.post(
+            "https://api.gradium.ai/v1/tts/synthesize",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=30,
+            verify=False,
+        )
+    except requests.RequestException as e:
+        return Response(f"Gradium request failed: {e}", status_code=502)
+
+    if r.status_code != 200:
+        return Response(f"Gradium error: {r.status_code} {r.text}", status_code=502)
 
     return Response(
         content=r.content,
