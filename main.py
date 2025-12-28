@@ -101,6 +101,7 @@ def stream_lichess_game(game_id: str):
     url = f"https://lichess.org/api/board/game/stream/{game_id}"
 
     moves_seen = []
+    human_color = None  # "white" ou "black"
 
     with requests.get(url, headers=headers, stream=True) as r:
         for line in r.iter_lines():
@@ -108,14 +109,25 @@ def stream_lichess_game(game_id: str):
                 continue
 
             data = json.loads(line.decode())
-            if data.get("type") == "gameState":
+
+            if data.get("type") == "gameFull":
+                white = data.get("white", {})
+                black = data.get("black", {})
+
+                if "aiLevel" in white:
+                    human_color = "black"
+                elif "aiLevel" in black:
+                    human_color = "white"
+
+            elif data.get("type") == "gameState":
                 moves = data.get("moves", "").split()
                 new_moves = moves[len(moves_seen):]
                 moves_seen = moves
 
-                for i, move in enumerate(new_moves):
-                    absolute_index = len(moves_seen) - len(new_moves) + i
-                    role = "PLAYER" if absolute_index % 2 == 0 else "AI"
+                for idx, move in enumerate(new_moves):
+                    move_index = len(moves_seen) - len(new_moves) + idx
+                    mover_color = "white" if move_index % 2 == 0 else "black"
+                    role = "PLAYER" if mover_color == human_color else "AI"
                     enqueue_commentary(game_id, role, move)
 
 
