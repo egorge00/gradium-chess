@@ -27,21 +27,34 @@ def index():
   <button id="go">Go</button>
 
   <script>
-    document.getElementById("go").onclick = async () => {
+    const button = document.getElementById("go");
+
+    button.addEventListener("click", async () => {
+      console.log("Go clicked");
+
+      // 🔑 Créer / activer AudioContext AVANT tout
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      await audioCtx.resume();
+
+      console.log("AudioContext state:", audioCtx.state);
+
       const res = await fetch("/tts", { method: "POST" });
+      console.log("POST /tts status:", res.status);
+
       if (!res.ok) {
-        alert("Erreur TTS");
+        alert("Erreur TTS: " + res.status);
         return;
       }
 
       const buffer = await res.arrayBuffer();
-      const audioCtx = new AudioContext();
+      console.log("Received audio bytes:", buffer.byteLength);
+
       const audioBuffer = await audioCtx.decodeAudioData(buffer);
       const src = audioCtx.createBufferSource();
       src.buffer = audioBuffer;
       src.connect(audioCtx.destination);
       src.start();
-    };
+    });
   </script>
 </body>
 </html>
