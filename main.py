@@ -14,48 +14,13 @@ SAMPLE_RATE = 24000
 
 
 @app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 def index():
     return """
 <!doctype html>
-<html lang="fr">
-<head>
-  <meta charset="utf-8">
-  <title>Gradium TTS Simple</title>
-</head>
+<html>
 <body>
-  <h1>Gradium TTS</h1>
-  <button id="go">Go</button>
-
-  <script>
-    const button = document.getElementById("go");
-
-    button.addEventListener("click", async () => {
-      console.log("Go clicked");
-
-      // 🔑 Créer / activer AudioContext AVANT tout
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      await audioCtx.resume();
-
-      console.log("AudioContext state:", audioCtx.state);
-
-      const res = await fetch("/tts", { method: "POST" });
-      console.log("POST /tts status:", res.status);
-
-      if (!res.ok) {
-        alert("Erreur TTS: " + res.status);
-        return;
-      }
-
-      const buffer = await res.arrayBuffer();
-      console.log("Received audio bytes:", buffer.byteLength);
-
-      const audioBuffer = await audioCtx.decodeAudioData(buffer);
-      const src = audioCtx.createBufferSource();
-      src.buffer = audioBuffer;
-      src.connect(audioCtx.destination);
-      src.start();
-    });
-  </script>
+  <button onclick="alert('CLICK OK')">Go</button>
 </body>
 </html>
 """
