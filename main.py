@@ -30,24 +30,23 @@ def index():
   <p>Phrase : <b>Bonjour, je m'appelle Georges</b></p>
   <button id="go">Go</button>
 
-  <script>
-    document.getElementById("go").addEventListener("click", async () => {
-      console.log("CLICK OK");
+ <script>
+  document.getElementById("go").addEventListener("click", async () => {
+    const response = await fetch("/tts", { method: "POST" });
 
-      const response = await fetch("/tts", { method: "POST" });
+    if (!response.ok) {
+      const text = await response.text();
+      alert("Erreur TTS : " + text);
+      return;
+    }
 
-      if (!response.ok) {
-        alert("Erreur TTS");
-        return;
-      }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
 
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-
-      const audio = new Audio(url);
-      audio.play();
-    });
-  </script>
+    const audio = new Audio(url);
+    audio.play();
+  });
+</script>
 </body>
 </html>
 """
