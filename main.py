@@ -1,53 +1,73 @@
 import os
-import requests
-import urllib3
+
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, Response
 
-# ⚠️ Gradium utilise un certificat self-signed en HTTP simple
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import gradium  # pip install gradium
 
 app = FastAPI()
 
 TEXT = "Bonjour, je m'appelle Georges"
-VOICE_ID = "b35yykvVppLXyw_l"  # ta voix coach
+VOICE_ID = "b35yykvVppLXyw_l"  # Elise (fr)
+OUTPUT_FORMAT = "wav"
 
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return """
-<!doctype html>
+    return """<!doctype html>
 <html lang="fr">
 <head>
-  <meta charset="utf-8">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Gradium TTS Simple</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 32px; }
+    button { font-size: 16px; padding: 10px 14px; }
+    #status { margin-top: 12px; color: #555; }
+  </style>
 </head>
 <body>
-  <h1>Gradium TTS – Test simple</h1>
-  <p>Phrase : « Bonjour, je m'appelle Georges »</p>
+  <h1>Gradium TTS Test</h1>
+  <p>Phrase : <b>Bonjour, je m'appelle Georges</b></p>
   <button id="go">Go</button>
+  <div id="status"></div>
+  <audio id="player" controls style="margin-top:12px; width: 100%; max-width: 520px;"></audio>
 
   <script>
-    document.getElementById("go").onclick = async () => {
+    const btn = document.getElementById("go");
+    const statusEl = document.getElementById("status");
+    const player = document.getElementById("player");
+
+    btn.addEventListener("click", async () => {
+      statusEl.textContent = "Génération audio…";
+      btn.disabled = true;
+
       try {
         const res = await fetch("/tts", { method: "POST" });
+        const ct = res.headers.get("content-type") || "";
+
         if (!res.ok) {
-          const txt = await res.text();
-          alert("Erreur TTS : " + txt);
+          const msg = await res.text().catch(() => "");
+          alert("Erreur TTS : " + (msg || ("HTTP " + res.status)));
+          statusEl.textContent = "";
           return;
         }
 
-        const arrayBuffer = await res.arrayBuffer();
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-        const source = audioCtx.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(audioCtx.destination);
-        source.start();
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+
+        player.src = url;
+        player.load();
+        await player.play();
+
+        statusEl.textContent = "Lecture OK";
       } catch (e) {
-        alert("Erreur JS : " + e);
+        alert("Erreur TTS : " + e);
+        statusEl.textContent = "";
+      } finally {
+        btn.disabled = false;
       }
-    };
+    });
   </script>
 </body>
 </html>
@@ -55,38 +75,26 @@ def index():
 
 
 @app.post("/tts")
-def tts():
+async def tts():
     api_key = os.getenv("GRADIUM_API_KEY")
     if not api_key:
-        return Response("GRADIUM_API_KEY manquante", status_code=500)
+        return Response("Missing GRADIUM_API_KEY", status_code=500)
 
-    payload = {
-        "text": TEXT,
-        "voice_id": VOICE_ID,
-        "format": "wav"
-    }
+    # Conformément à la doc Gradium: client.tts(setup={voice_id, output_format, model_name}, text=...)
+    # output_format "wav" renvoie directement un WAV lisible côté navigateur.
+    client = gradium.client.GradiumClient(api_key=api_key)
 
     try:
-        r = requests.post(
-            "https://api.gradium.ai/v1/tts/synthesize",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
+        result = await client.tts(
+            setup={
+                "model_name": "default",
+                "voice_id": VOICE_ID,
+                "output_format": OUTPUT_FORMAT,
             },
-            json=payload,
-            timeout=30,
-            verify=False,  # IMPORTANT pour Gradium en HTTP simple
+            text=TEXT,
         )
-    except requests.RequestException as e:
-        return Response(f"Erreur requête Gradium : {e}", status_code=502)
+    except Exception as e:
+        # On renvoie un message lisible par ton alert() côté front
+        return Response(f"Gradium error: {e}", status_code=502)
 
-    if r.status_code != 200:
-        return Response(
-            f"Erreur Gradium {r.status_code}: {r.text}",
-            status_code=502,
-        )
-
-    return Response(
-        content=r.content,
-        media_type="audio/wav",
-    )
+    return Response(content=result.raw_data, media_type="audio/wav")
