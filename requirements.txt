@@ -1,6 +1,7 @@
 fastapi
 google-genai
 gradium
+python-chess
 requests
 uvicorn
 websockets
