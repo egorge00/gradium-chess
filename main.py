@@ -1,11 +1,15 @@
 import os
 
+import gradium
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 app = FastAPI()
+
+VOICE_WHITE = "b35yykvVppLXyw_l"
+VOICE_BLACK = "axlOaUiFyOZhy4nv"
 
 
 class CommentaryRequest(BaseModel):
@@ -15,6 +19,11 @@ class CommentaryRequest(BaseModel):
 
 class CommentaryResponse(BaseModel):
     text: str
+
+
+class TTSRequest(BaseModel):
+    text: str
+    color: str
 
 
 @app.post("/commentary", response_model=CommentaryResponse)
@@ -67,6 +76,36 @@ Couleur : {req.color}
         return {"text": text}
     except Exception:
         return {"text": "Je réfléchis encore à ce coup."}
+
+
+@app.post("/tts")
+async def tts(req: TTSRequest):
+    text = req.text
+    color = req.color
+
+    if not text or color not in ("white", "black"):
+        return Response("Invalid payload", status_code=400)
+
+    api_key = os.getenv("GRADIUM_API_KEY")
+    if not api_key:
+        return Response("Missing GRADIUM_API_KEY", status_code=500)
+
+    voice_id = VOICE_WHITE if color == "white" else VOICE_BLACK
+    client = gradium.client.GradiumClient(api_key=api_key)
+
+    try:
+        result = await client.tts(
+            setup={
+                "model_name": "default",
+                "voice_id": voice_id,
+                "output_format": "wav",
+            },
+            text=text,
+        )
+    except Exception as exc:
+        return Response(f"Gradium error: {exc}", status_code=502)
+
+    return Response(content=result.raw_data, media_type="audio/wav")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -221,10 +260,33 @@ async function sendMoveToCoach(move, color) {
       body: JSON.stringify({ move, color })
     });
     const data = await res.json();
-    coachEl.textContent = data.text || "";
+    const text = data.text || "";
+    coachEl.textContent = text;
+    if (text) {
+      await playTTS(text, color);
+    }
   } catch (error) {
     coachEl.textContent = "Je réfléchis encore à ce coup.";
   }
+}
+
+async function playTTS(text, color) {
+  const res = await fetch("/tts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, color })
+  });
+
+  if (!res.ok) {
+    console.error("TTS error");
+    return;
+  }
+
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+  audio.onended = () => URL.revokeObjectURL(url);
+  await audio.play();
 }
 
 function coord(pos) {
