@@ -13,11 +13,18 @@ def index():
   <meta charset="utf-8" />
   <title>Chess Demo – Local Board</title>
 
-  <!-- Chessboard.js CSS -->
+  <!-- REQUIRED: jQuery -->
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+
+  <!-- Chessboard.js -->
   <link
     rel="stylesheet"
     href="https://unpkg.com/chessboardjs@1.0.0/www/css/chessboard.css"
   />
+  <script src="https://unpkg.com/chessboardjs@1.0.0/www/js/chessboard.js"></script>
+
+  <!-- Chess.js -->
+  <script src="https://unpkg.com/chess.js@1.0.0/chess.min.js"></script>
 
   <style>
     body {
@@ -42,24 +49,18 @@ def index():
 <body>
 
   <h1>Chess Demo (local)</h1>
-  <p>Joue les blancs et les noirs, librement.</p>
+  <p>Joue les blancs et les noirs librement.</p>
 
   <div id="board"></div>
 
   <div id="log">Coups joués :</div>
-
-  <!-- Libraries -->
-  <script src="https://unpkg.com/chess.js@1.0.0/chess.min.js"></script>
-  <script src="https://unpkg.com/chessboardjs@1.0.0/www/js/chessboard.js"></script>
 
   <script>
     const game = new Chess();
     const logEl = document.getElementById("log");
 
     function logMove(move) {
-      logEl.textContent =
-        logEl.textContent + "\\n" +
-        move.color.toUpperCase() + ": " + move.san;
+      logEl.textContent += "\\n" + move.color.toUpperCase() + ": " + move.san;
     }
 
     const board = Chessboard("board", {
@@ -72,9 +73,7 @@ def index():
           promotion: "q"
         });
 
-        if (move === null) {
-          return "snapback";
-        }
+        if (move === null) return "snapback";
 
         logMove(move);
       }
