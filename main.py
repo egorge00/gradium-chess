@@ -11,17 +11,10 @@ def index():
 <html lang="fr">
 <head>
   <meta charset="utf-8" />
-  <title>Chess Demo – Local Board</title>
+  <title>Chess Demo – Simple</title>
 
-  <!-- REQUIRED: jQuery -->
-  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
-
-  <!-- Chessboard.js -->
-  <link
-    rel="stylesheet"
-    href="https://unpkg.com/chessboardjs@1.0.0/www/css/chessboard.css"
-  />
-  <script src="https://unpkg.com/chessboardjs@1.0.0/www/js/chessboard.js"></script>
+  <!-- Chessboard Web Component -->
+  <script type="module" src="https://unpkg.com/chessboard-element@1.6.4/dist/chessboard-element.js"></script>
 
   <!-- Chess.js -->
   <script src="https://unpkg.com/chess.js@1.0.0/chess.min.js"></script>
@@ -31,7 +24,7 @@ def index():
       font-family: Arial, sans-serif;
       margin: 32px;
     }
-    #board {
+    chess-board {
       width: 400px;
       margin-bottom: 16px;
     }
@@ -51,32 +44,31 @@ def index():
   <h1>Chess Demo (local)</h1>
   <p>Joue les blancs et les noirs librement.</p>
 
-  <div id="board"></div>
+  <chess-board id="board" draggable></chess-board>
 
   <div id="log">Coups joués :</div>
 
   <script>
     const game = new Chess();
+    const board = document.getElementById("board");
     const logEl = document.getElementById("log");
 
-    function logMove(move) {
-      logEl.textContent += "\\n" + move.color.toUpperCase() + ": " + move.san;
-    }
+    board.addEventListener("drop", (event) => {
+      const { source, target } = event.detail;
 
-    const board = Chessboard("board", {
-      draggable: true,
-      position: "start",
-      onDrop: function (source, target) {
-        const move = game.move({
-          from: source,
-          to: target,
-          promotion: "q"
-        });
+      const move = game.move({
+        from: source,
+        to: target,
+        promotion: "q"
+      });
 
-        if (move === null) return "snapback";
-
-        logMove(move);
+      if (!move) {
+        event.preventDefault();
+        return;
       }
+
+      logEl.textContent += "\\n" + move.color.toUpperCase() + ": " + move.san;
+      board.position = game.fen();
     });
   </script>
 
