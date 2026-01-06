@@ -7,7 +7,7 @@ import gradium  # pip install gradium
 
 app = FastAPI()
 
-TEXT = "Bonjour, je m'appelle Georges"
+TEXT = "Bonjour, ici la Terre"
 VOICE_ID = "b35yykvVppLXyw_l"  # Elise (fr)
 OUTPUT_FORMAT = "wav"
 
@@ -28,10 +28,8 @@ def index():
 </head>
 <body>
   <h1>Gradium TTS Test</h1>
-  <p>Phrase : <b>Bonjour, je m'appelle Georges</b></p>
   <button id="go">Go</button>
   <div id="status"></div>
-  <audio id="player" controls style="margin-top:12px; width: 100%; max-width: 520px;"></audio>
 
   <script>
     const btn = document.getElementById("go");
