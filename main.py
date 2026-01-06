@@ -1,11 +1,17 @@
 import os
 import requests
+import urllib3
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, Response
+
+# ⚠️ Gradium utilise un certificat self-signed en HTTP simple
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI()
 
 TEXT = "Bonjour, je m'appelle Georges"
+VOICE_ID = "b35yykvVppLXyw_l"  # ta voix coach
+
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -14,38 +20,34 @@ def index():
 <html lang="fr">
 <head>
   <meta charset="utf-8">
-  <title>Mistral Voxtral TTS Test</title>
+  <title>Gradium TTS Simple</title>
 </head>
 <body>
-  <h1>Test Mistral Voxtral TTS</h1>
-  <p>Phrase : Bonjour, je m'appelle Georges</p>
+  <h1>Gradium TTS – Test simple</h1>
+  <p>Phrase : « Bonjour, je m'appelle Georges »</p>
   <button id="go">Go</button>
 
   <script>
-    const button = document.getElementById("go");
-
-    button.addEventListener("click", async () => {
+    document.getElementById("go").onclick = async () => {
       try {
-        const response = await fetch("/tts", { method: "POST" });
-        if (!response.ok) {
-          const text = await response.text();
-          alert("Erreur TTS : " + text);
+        const res = await fetch("/tts", { method: "POST" });
+        if (!res.ok) {
+          const txt = await res.text();
+          alert("Erreur TTS : " + txt);
           return;
         }
 
-        const arrayBuffer = await response.arrayBuffer();
+        const arrayBuffer = await res.arrayBuffer();
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-
         const source = audioCtx.createBufferSource();
         source.buffer = audioBuffer;
         source.connect(audioCtx.destination);
         source.start();
       } catch (e) {
-        alert("Erreur lecture audio");
-        console.error(e);
+        alert("Erreur JS : " + e);
       }
-    });
+    };
   </script>
 </body>
 </html>
@@ -54,33 +56,33 @@ def index():
 
 @app.post("/tts")
 def tts():
-    api_key = os.getenv("MISTRAL_API_KEY")
+    api_key = os.getenv("GRADIUM_API_KEY")
     if not api_key:
-        return Response("Missing MISTRAL_API_KEY", status_code=500)
+        return Response("GRADIUM_API_KEY manquante", status_code=500)
 
     payload = {
-        "model": "voxtral-mini",
-        "input": TEXT,
-        "voice": "alloy",
+        "text": TEXT,
+        "voice_id": VOICE_ID,
         "format": "wav"
     }
 
     try:
         r = requests.post(
-            "https://api.mistral.ai/v1/audio/speech",
+            "https://api.gradium.ai/v1/tts/synthesize",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             json=payload,
             timeout=30,
+            verify=False,  # IMPORTANT pour Gradium en HTTP simple
         )
     except requests.RequestException as e:
-        return Response(f"Request failed: {e}", status_code=502)
+        return Response(f"Erreur requête Gradium : {e}", status_code=502)
 
     if r.status_code != 200:
         return Response(
-            f"Mistral error {r.status_code}: {r.text}",
+            f"Erreur Gradium {r.status_code}: {r.text}",
             status_code=502,
         )
 
