@@ -10,24 +10,27 @@ def index():
 <!doctype html>
 <html lang="fr">
 <head>
-  <meta charset="utf-8" />
-  <title>Chess Demo – Simple</title>
-
-  <!-- Chessboard Web Component -->
-  <script type="module" src="https://unpkg.com/chessboard-element@1.6.4/dist/chessboard-element.js"></script>
-
-  <!-- Chess.js -->
-  <script src="https://unpkg.com/chess.js@1.0.0/chess.min.js"></script>
-
+  <meta charset="utf-8">
+  <title>Chess Demo (Ultra Simple)</title>
   <style>
     body {
       font-family: Arial, sans-serif;
       margin: 32px;
     }
-    chess-board {
-      width: 400px;
-      margin-bottom: 16px;
+    table {
+      border-collapse: collapse;
     }
+    td {
+      width: 60px;
+      height: 60px;
+      text-align: center;
+      vertical-align: middle;
+      font-size: 40px;
+      cursor: pointer;
+    }
+    .white { background: #f0d9b5; }
+    .black { background: #b58863; }
+    .selected { outline: 3px solid red; }
     #log {
       margin-top: 16px;
       padding: 12px;
@@ -35,42 +38,79 @@ def index():
       border-radius: 8px;
       font-family: monospace;
       white-space: pre-wrap;
-      max-width: 400px;
+      max-width: 500px;
     }
   </style>
 </head>
 <body>
 
-  <h1>Chess Demo (local)</h1>
-  <p>Joue les blancs et les noirs librement.</p>
+<h1>Chess Demo (local)</h1>
+<p>Joue les blancs et les noirs librement.</p>
 
-  <chess-board id="board" draggable></chess-board>
+<table id="board"></table>
 
-  <div id="log">Coups joués :</div>
+<div id="log">Coups joués :</div>
 
-  <script>
-    const game = new Chess();
-    const board = document.getElementById("board");
-    const logEl = document.getElementById("log");
+<script>
+const pieces = [
+  ["♜","♞","♝","♛","♚","♝","♞","♜"],
+  ["♟","♟","♟","♟","♟","♟","♟","♟"],
+  ["","","","","","","",""],
+  ["","","","","","","",""],
+  ["","","","","","","",""],
+  ["","","","","","","",""],
+  ["♙","♙","♙","♙","♙","♙","♙","♙"],
+  ["♖","♘","♗","♕","♔","♗","♘","♖"]
+];
 
-    board.addEventListener("drop", (event) => {
-      const { source, target } = event.detail;
+const boardEl = document.getElementById("board");
+const logEl = document.getElementById("log");
 
-      const move = game.move({
-        from: source,
-        to: target,
-        promotion: "q"
-      });
+let selected = null;
 
-      if (!move) {
-        event.preventDefault();
-        return;
+function render() {
+  boardEl.innerHTML = "";
+  for (let r = 0; r < 8; r++) {
+    const row = document.createElement("tr");
+    for (let c = 0; c < 8; c++) {
+      const cell = document.createElement("td");
+      cell.textContent = pieces[r][c];
+      cell.dataset.r = r;
+      cell.dataset.c = c;
+      cell.className = (r + c) % 2 === 0 ? "white" : "black";
+      if (selected && selected.r == r && selected.c == c) {
+        cell.classList.add("selected");
       }
+      cell.onclick = () => onCellClick(r, c);
+      row.appendChild(cell);
+    }
+    boardEl.appendChild(row);
+  }
+}
 
-      logEl.textContent += "\\n" + move.color.toUpperCase() + ": " + move.san;
-      board.position = game.fen();
-    });
-  </script>
+function onCellClick(r, c) {
+  if (selected) {
+    const piece = pieces[selected.r][selected.c];
+    pieces[selected.r][selected.c] = "";
+    pieces[r][c] = piece;
+
+    logEl.textContent += `\\n${piece} : ${coord(selected)} → ${coord({r,c})}`;
+
+    selected = null;
+    render();
+  } else if (pieces[r][c] !== "") {
+    selected = { r, c };
+    render();
+  }
+}
+
+function coord(pos) {
+  const files = "abcdefgh";
+  return files[pos.c] + (8 - pos.r);
+}
+
+render();
+</script>
 
 </body>
 </html>
